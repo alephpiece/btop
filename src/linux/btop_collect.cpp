@@ -1075,13 +1075,13 @@ namespace Cpu {
 		return watts;
 	}
 
-    static constexpr auto to_int(std::string_view view) {
+    static auto to_int(std::string_view view) {
         std::uint32_t value {};
         std::from_chars(view.data(), view.data() + view.size(), value);
         return value;
     }
 
-    static constexpr auto detect_active_cpus() {
+    static auto detect_active_cpus() {
         auto stream = std::ifstream { "/sys/fs/cgroup/cpuset.cpus.effective" };
         auto buf = std::string { std::istreambuf_iterator<char> { stream }, {} };
         auto cpus = std::vector<std::int32_t> {};
