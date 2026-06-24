@@ -473,8 +473,8 @@ $(BUILDDIR)/%.c.o: $(SRCDIR)/$(PLATFORM_DIR)/intel_gpu_top/%.c | directories
 	@sleep 0.3 2>/dev/null || true
 	@TSTAMP=$$(date +%s 2>/dev/null || echo "0")
 	@$(QUIET) || $(call white,Compiling $<)
-	@$(VERBOSE) || printf "$(CC) $(INC) -c -o $@ $<\n"
-	@$(CC) $(INC) -w -c -o $@ $< || exit 1
+	@$(VERBOSE) || printf "$(CC) $(INC) -D_GNU_SOURCE -c -o $@ $<\n"
+	@$(CC) $(INC) -D_GNU_SOURCE -w -c -o $@ $< || exit 1
 	@$(call green,$$($(PROGRESS))%$(call CUR_LEFT,10)$(call CUR_RIGHT,5)-> $(call file_with_size,$@,$(call CUR_LEFT,100)$(call CUR_RIGHT,38)) $(GREEN)($(WHITE)$(call step_duration,$$TSTAMP)$(GREEN)))
 
 

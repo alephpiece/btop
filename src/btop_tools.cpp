@@ -122,10 +122,18 @@ namespace Term {
         bool net = boxes.find("net") != string::npos;
         bool proc = boxes.find("proc") != string::npos;
 	#ifdef GPU_SUPPORT
-		int gpu = 0;
-        if (Gpu::count > 0)
-        	for (char i = '0'; i <= '5'; i++)
-        		gpu += (boxes.contains("gpu"s + i) ? 1 : 0);
+		vector<int> gpu_panels;
+        if (Gpu::count > 0) {
+			std::istringstream iss(boxes, std::istringstream::in);
+			string current;
+			while (iss >> current) {
+				if (current.starts_with("gpu") and current.size() == 4) {
+					const int gpu_index = current[3] - '0';
+					if (gpu_index >= 0 and gpu_index < Gpu::count)
+						gpu_panels.push_back(gpu_index);
+				}
+			}
+		}
 	#endif
         int width = 0;
 		if (mem) width = Mem::min_width;
@@ -133,15 +141,46 @@ namespace Term {
 		width += (proc ? Proc::min_width : 0);
 		if (cpu and width < Cpu::min_width) width = Cpu::min_width;
 	#ifdef GPU_SUPPORT
-		if (gpu != 0 and width < Gpu::min_width) width = Gpu::min_width;
+		if (not gpu_panels.empty() and width < Gpu::min_width) width = Gpu::min_width;
 	#endif
 
 		int height = (cpu ? Cpu::min_height : 0);
 		if (proc) height += Proc::min_height;
 		else height += (mem ? Mem::min_height : 0) + (net ? Net::min_height : 0);
 	#ifdef GPU_SUPPORT
-		for (int i = 0; i < gpu; i++)
-			height += Gpu::gpu_b_height_offsets[i] + 4;
+		auto gpu_min_height = [](const int gpu_index) {
+			return std::cmp_less(gpu_index, Gpu::gpu_b_height_offsets.size())
+				? Gpu::gpu_b_height_offsets[gpu_index] + 4
+				: Gpu::min_height;
+		};
+		for (const int gpu_index : gpu_panels)
+			height += gpu_min_height(gpu_index);
+
+		if (cpu and not gpu_panels.empty()) {
+			const auto& show_gpu_info = Config::getS("show_gpu_info");
+			const int inline_gpu_rows = show_gpu_info == "On"
+				? Gpu::count
+				: show_gpu_info == "Auto" ? max(0, Gpu::count - static_cast<int>(gpu_panels.size()))
+				: 0;
+			// Mirror the CPU height used by Draw::calcSizes() so invalid GPU layouts are rejected before drawing boxes.
+			int cpu_height = max(
+				Cpu::min_height,
+				static_cast<int>(std::ceil(static_cast<double>(Term::height)
+					* (32.0 / static_cast<double>(gpu_panels.size() + 1) + 5.0) / 100.0))
+			);
+			if (cpu_height <= Term::height - inline_gpu_rows)
+				cpu_height += inline_gpu_rows;
+
+			int gpu_layout_height = 0;
+			for (const int gpu_index : gpu_panels)
+				gpu_layout_height += (mem or net or proc)
+					? max(gpu_min_height(gpu_index), cpu_height)
+					: gpu_min_height(gpu_index);
+			const int other_min_height = proc
+				? Proc::min_height
+				: (mem ? Mem::min_height : 0) + (net ? Net::min_height : 0);
+			height = max(height, cpu_height + gpu_layout_height + other_min_height);
+		}
 	#endif
 
 		return { width, height };

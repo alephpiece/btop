@@ -252,6 +252,7 @@ namespace Gpu {
 		struct rsmi_version_t {uint32_t major,  minor,  patch; const char* build;};
 		struct rsmi_frequencies_t_v5 {uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES_V5];};
 		struct rsmi_frequencies_t_v6 {bool has_deep_sleep; uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES_V6];};
+		struct rsmi_pcie_bandwidth_info_t {double tx_bw, rx_bw, tx_rx_bw;};
 
 		//? Function pointers
 		rsmi_status_t (*rsmi_init)(uint64_t);
@@ -269,6 +270,7 @@ namespace Gpu {
 		rsmi_status_t (*rsmi_dev_memory_total_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_memory_usage_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_pci_throughput_get)(uint32_t, uint64_t*, uint64_t*, uint64_t*);
+		rsmi_status_t (*rsmi_dev_pcie_bandwidth_get)(uint32_t, int, rsmi_pcie_bandwidth_info_t*);
 
 		uint32_t version_major = 0;
 
@@ -276,6 +278,9 @@ namespace Gpu {
 		void* rsmi_dl_handle;
 	#endif
 		bool initialized = false;
+		bool skip_temp_max = false;
+		bool query_pcie_speeds = true;
+		bool use_pcie_bandwidth = false;
 		bool init();
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
@@ -1079,26 +1084,38 @@ namespace Cpu {
     static constexpr auto detect_active_cpus() {
         auto stream = std::ifstream { "/sys/fs/cgroup/cpuset.cpus.effective" };
         auto buf = std::string { std::istreambuf_iterator<char> { stream }, {} };
+        auto cpus = std::vector<std::int32_t> {};
 
         if (buf.empty()) {
-            return std::views::iota(0, Shared::coreCount) | std::ranges::to<std::vector<std::int32_t>>();
+            cpus.reserve(Shared::coreCount);
+            for (std::int32_t cpu = 0; cpu < Shared::coreCount; ++cpu) {
+                cpus.push_back(cpu);
+            }
+            return cpus;
         }
 
-        return buf | std::views::split(',') | std::views::transform([](auto&& range) -> auto {
-                   auto view = std::string_view { range };
-                   auto dash = view.find('-');
+        size_t start_pos = 0;
+        while (start_pos <= buf.size()) {
+            const auto end_pos = buf.find(',', start_pos);
+            const auto view = std::string_view { buf }.substr(start_pos, end_pos == std::string::npos ? std::string_view::npos : end_pos - start_pos);
+            const auto dash = view.find('-');
 
-                   if (dash == std::string_view::npos) {
-                       // Single CPU, return iota of single element
-                       auto value = to_int(view);
-                       return std::views::iota(value, value + 1);
-                   }
+            if (dash == std::string_view::npos) {
+                cpus.push_back(to_int(view));
+            }
+            else {
+                const auto start = to_int(view.substr(0, dash));
+                const auto end = to_int(view.substr(dash + 1));
+                for (auto cpu = start; cpu <= end; ++cpu) {
+                    cpus.push_back(cpu);
+                }
+            }
 
-                   auto start = to_int(view.substr(0, dash));
-                   auto end = to_int(view.substr(dash + 1));
-                   return std::views::iota(start, end + 1);
-               }) |
-               std::views::join | std::ranges::to<std::vector<std::int32_t>>();
+            if (end_pos == std::string::npos) break;
+            start_pos = end_pos + 1;
+        }
+
+        return cpus;
     }
 
 	auto collect(bool no_update) -> cpu_info& {
@@ -1560,12 +1577,18 @@ namespace Gpu {
 	namespace Rsmi {
 		bool init() {
 			if (initialized) return false;
+			skip_temp_max = false;
+			query_pcie_speeds = true;
+			use_pcie_bandwidth = false;
 
 			//? Dynamic loading & linking
 		#if !defined(RSMI_STATIC)
+			rsmi_dev_pci_throughput_get = nullptr;
+			rsmi_dev_pcie_bandwidth_get = nullptr;
 
 			//? Try possible library paths and names for librocm_smi64.so
 			const array libRocAlts = {
+				"/opt/hyhal/lib/librocm_smi64.so",
 				"/opt/rocm/lib/librocm_smi64.so",
 				"librocm_smi64.so",
 				"librocm_smi64.so.5", // fedora
@@ -1587,6 +1610,7 @@ namespace Gpu {
 			}
 
 			auto load_rsmi_sym = [&](const char sym_name[]) {
+				(void)dlerror();
 				auto sym = dlsym(rsmi_dl_handle, sym_name);
 				auto err = dlerror();
 				if (err != nullptr) {
@@ -1594,6 +1618,33 @@ namespace Gpu {
 					return (void*)nullptr;
 				} else return sym;
 			};
+
+			auto load_optional_rsmi_sym = [&](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(rsmi_dl_handle, sym_name);
+				auto err = dlerror();
+				return err == nullptr ? sym : nullptr;
+			};
+
+			auto has_rsmi_sym = [&](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(rsmi_dl_handle, sym_name);
+				auto err = dlerror();
+				return sym != nullptr and err == nullptr;
+			};
+
+			const bool is_hygon_rsmi = has_rsmi_sym("rsmi_hy_version_get");
+			if (is_hygon_rsmi) {
+				skip_temp_max = true;
+				query_pcie_speeds = false;
+				rsmi_dev_pcie_bandwidth_get = (decltype(rsmi_dev_pcie_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_pcie_bandwidth_get");
+				use_pcie_bandwidth = rsmi_dev_pcie_bandwidth_get != nullptr;
+				if (use_pcie_bandwidth) {
+					Logger::debug("ROCm SMI: detected Hygon compatibility library; skipping maximum GPU temperature and using fast PCIe bandwidth queries");
+				} else {
+					Logger::debug("ROCm SMI: detected Hygon compatibility library; skipping maximum GPU temperature and PCIe throughput queries");
+				}
+			}
 
             #define LOAD_SYM(NAME)  if ((NAME = (decltype(NAME))load_rsmi_sym(#NAME)) == nullptr) return false
 
@@ -1609,7 +1660,9 @@ namespace Gpu {
 		    LOAD_SYM(rsmi_dev_power_ave_get);
 		    LOAD_SYM(rsmi_dev_memory_total_get);
 		    LOAD_SYM(rsmi_dev_memory_usage_get);
-		    LOAD_SYM(rsmi_dev_pci_throughput_get);
+			if (not is_hygon_rsmi) {
+				LOAD_SYM(rsmi_dev_pci_throughput_get);
+			}
 
             #undef LOAD_SYM
         #endif
@@ -1630,18 +1683,31 @@ namespace Gpu {
 				return false;
 			}
 
-			// Two distinct real-world libraries report version.major == 1:
+			// Some real-world libraries report versions that do not match the ABI:
 			//   - ROCm 7.2 ships the v6 ABI (see upstream PR #1566).
 			//   - Debian/Ubuntu's librocm-smi64 is built from 5.x sources but
 			//     rocm_smi64Config.h reports version 1.0.0, so the ABI is v5.
+			//   - Hygon DTK/HYHAL versions can report non-upstream versions while
+			//     exposing a v6-compatible ABI.
 			// Probe a 6.x-only symbol to disambiguate instead of guessing.
 			uint32_t effective_major = version.major;
 			if (version.major == 1) {
-				bool has_v6_symbol = (dlsym(rsmi_dl_handle, "rsmi_dev_activity_metric_get") != nullptr);
-				(void)dlerror(); // clear error state from the probe
+				bool has_v6_symbol = has_rsmi_sym("rsmi_dev_activity_metric_get");
 				effective_major = has_v6_symbol ? 6 : 5;
 				Logger::warning("ROCm SMI: library reports version 1.x; assuming {}.x ABI based on symbol probe",
 					has_v6_symbol ? "6" : "5");
+			} else if (version.major != 5 and version.major != 6 and version.major != 7) {
+				bool has_v6_symbol = has_rsmi_sym("rsmi_dev_activity_metric_get");
+				if (has_v6_symbol) {
+					effective_major = 6;
+					Logger::warning("ROCm SMI: library reports version {}.{}.{}; assuming 6.x ABI based on symbol probe",
+						version.major, version.minor, version.patch);
+					if (version.major == 2) {
+						skip_temp_max = true;
+						query_pcie_speeds = false;
+						Logger::debug("ROCm SMI: skipping maximum GPU temperature and PCIe throughput queries for DTK 2.x");
+					}
+				}
 			}
 
 			if (effective_major == 5) {
@@ -1652,7 +1718,8 @@ namespace Gpu {
 				if ((rsmi_dev_gpu_clk_freq_get_v6 = (decltype(rsmi_dev_gpu_clk_freq_get_v6))load_rsmi_sym("rsmi_dev_gpu_clk_freq_get")) == nullptr)
 					return false;
 			} else {
-				Logger::warning("ROCm SMI: Dynamic loading only supported for version 5 and 6");
+				Logger::warning("ROCm SMI: Dynamic loading only supported for version 5 and 6 compatible ABIs, got {}.{}.{}",
+					version.major, version.minor, version.patch);
 				return false;
 			}
 			version_major = effective_major;
@@ -1715,11 +1782,13 @@ namespace Gpu {
 					}
 
 					//? Get temp_max
-					int64_t temp_max;
-    				result = rsmi_dev_temp_metric_get(i, RSMI_TEMP_TYPE_EDGE, RSMI_TEMP_MAX, &temp_max);
-        			if (result != RSMI_STATUS_SUCCESS)
-    					Logger::warning("ROCm SMI: Failed to get maximum GPU temperature, defaulting to 110°C");
-    				else gpus_slice[i].temp_max = (long long)temp_max;
+					if (not skip_temp_max) {
+						int64_t temp_max;
+						result = rsmi_dev_temp_metric_get(i, RSMI_TEMP_TYPE_EDGE, RSMI_TEMP_MAX, &temp_max);
+						if (result != RSMI_STATUS_SUCCESS)
+							Logger::warning("ROCm SMI: Failed to get maximum GPU temperature, defaulting to 110°C");
+						else gpus_slice[i].temp_max = (long long)temp_max;
+					}
 
 					//? Disable encoder and decoder utilisation on AMD
 					gpus_slice[i].supported_functions.encoder_utilization = false;
@@ -1887,7 +1956,33 @@ namespace Gpu {
 				}
 
 				//? PCIe link speeds
-				if ((gpus_slice[i].supported_functions.pcie_txrx and Config::getB("rsmi_measure_pcie_speeds")) or is_init) {
+			#if !defined(RSMI_STATIC)
+				if (use_pcie_bandwidth) {
+					if (gpus_slice[i].supported_functions.pcie_txrx and Config::getB("rsmi_measure_pcie_speeds")) {
+						rsmi_pcie_bandwidth_info_t bandwidth{};
+						result = rsmi_dev_pcie_bandwidth_get(i, 0, &bandwidth);
+						if (result != RSMI_STATUS_SUCCESS) {
+							Logger::warning("ROCm SMI: Failed to get PCIe bandwidth");
+							if constexpr(is_init) gpus_slice[i].supported_functions.pcie_txrx = false;
+						} else {
+							auto mbps_to_kbps = [](double value) -> long long {
+								if (not std::isfinite(value) or value <= 0.0) return 0;
+								return (long long)std::llround(value * 1000.0);
+							};
+							gpus_slice[i].pcie_tx = mbps_to_kbps(bandwidth.tx_bw);
+							gpus_slice[i].pcie_rx = mbps_to_kbps(bandwidth.rx_bw);
+						}
+					} else {
+						gpus_slice[i].pcie_tx = -1;
+						gpus_slice[i].pcie_rx = -1;
+					}
+				} else
+			#endif
+				if (not query_pcie_speeds) {
+					if constexpr(is_init) gpus_slice[i].supported_functions.pcie_txrx = false;
+					gpus_slice[i].pcie_tx = -1;
+					gpus_slice[i].pcie_rx = -1;
+				} else if ((gpus_slice[i].supported_functions.pcie_txrx and Config::getB("rsmi_measure_pcie_speeds")) or is_init) {
 					uint64_t tx, rx;
 					result = rsmi_dev_pci_throughput_get(i, &tx, &rx, nullptr);
     				if (result != RSMI_STATUS_SUCCESS) {

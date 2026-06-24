@@ -254,6 +254,7 @@ namespace Draw {
 			const std::string_view title2, const int num
 	) {
 		string out;
+		if (width < 2 or height < 2) return out;
 
 		if (line_color.empty())
 			line_color = Theme::c("div_line");

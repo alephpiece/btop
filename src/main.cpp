@@ -2,11 +2,16 @@
 
 #include "btop.hpp"
 
-#include <iterator>
-#include <ranges>
 #include <string_view>
 #include <vector>
 
 auto main(int argc, const char* argv[]) -> int {
-	return btop_main(std::views::counted(std::next(argv), argc - 1) | std::ranges::to<std::vector<std::string_view>>());
+	auto args = std::vector<std::string_view>{};
+	args.reserve(argc > 0 ? static_cast<size_t>(argc - 1) : 0);
+
+	for (int i = 1; i < argc; ++i) {
+		args.emplace_back(argv[i]);
+	}
+
+	return btop_main(args);
 }
