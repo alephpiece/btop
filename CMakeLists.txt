@@ -30,6 +30,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BTOP_STATIC "Link btop statically" OFF)
 option(BTOP_GPU "Enable GPU support" ON)
+option(BTOP_PACKAGE "Enable CPack package generation" OFF)
 cmake_dependent_option(BTOP_RSMI_STATIC "Link statically to ROCm SMI" OFF "BTOP_GPU" OFF)
 
 # Enable LTO in release builds by default
@@ -268,6 +269,10 @@ install(FILES "btop.desktop" DESTINATION "share/applications")
 install(FILES "Img/icon.png" DESTINATION "share/icons/hicolor/48x48/apps" RENAME "btop.png")
 install(FILES "Img/icon.svg" DESTINATION "share/icons/hicolor/scalable/apps" RENAME "btop.svg")
 install(DIRECTORY "themes" DESTINATION "share/btop")
+
+if(BTOP_PACKAGE)
+  include(cmake/Packaging.cmake)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

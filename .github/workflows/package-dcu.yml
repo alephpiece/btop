@@ -1,0 +1,181 @@
+name: Package DCU
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_formats:
+        description: 'Package formats to generate'
+        default: 'both'
+        required: true
+        type: choice
+        options:
+          - both
+          - rpm
+          - deb
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    container: almalinux:8
+    env:
+      MAMBA_ROOT_PREFIX: /opt/micromamba/root
+      MICROMAMBA: /opt/micromamba/bin/micromamba
+      MICROMAMBA_ENV: /opt/micromamba/envs/btop-build
+      BUILD_DIR: build-package
+      DIST_DIR: dist
+    steps:
+      - name: Install system packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y dnf-plugins-core
+          dnf install -y epel-release \
+            || dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+          dnf config-manager --set-enabled powertools || true
+          dnf config-manager --set-enabled PowerTools || true
+          dnf install -y \
+            bzip2 \
+            ca-certificates \
+            curl \
+            dpkg \
+            findutils \
+            git-core \
+            gzip \
+            rpm-build \
+            tar \
+            which \
+            xz
+          command -v git
+          command -v rpm
+          command -v rpmbuild
+          command -v dpkg-deb
+          getconf GNU_LIBC_VERSION
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set package version metadata
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git_short_sha="$(git rev-parse --short HEAD)"
+          echo "git_short_sha=${git_short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create micromamba build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/micromamba/bin /opt/micromamba/root /opt/micromamba/envs
+          curl -Ls "https://micro.mamba.pm/api/micromamba/$(uname)-$(uname -m)/latest" \
+            | tar -xvj -C /tmp bin/micromamba
+          install -m 0755 /tmp/bin/micromamba "${MICROMAMBA}"
+          "${MICROMAMBA}" create -y \
+            -p "${MICROMAMBA_ENV}" \
+            -c conda-forge \
+            --strict-channel-priority \
+            cmake ninja make c-compiler cxx-compiler pkg-config
+
+      - name: Check packaging environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "${MICROMAMBA}"
+          test -d "${MICROMAMBA_ENV}"
+          if [[ "${{ inputs.package_formats }}" == "both" || "${{ inputs.package_formats }}" == "rpm" ]]; then
+            command -v rpm
+            command -v rpmbuild
+          fi
+          if [[ "${{ inputs.package_formats }}" == "both" || "${{ inputs.package_formats }}" == "deb" ]]; then
+            command -v dpkg-deb
+          fi
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" cmake --version
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" ninja --version
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" g++ --version
+          getconf GNU_LIBC_VERSION
+
+      - name: Configure
+        shell: bash
+        env:
+          GIT_SHORT_SHA: ${{ steps.version.outputs.git_short_sha }}
+        run: |
+          set -euo pipefail
+          rm -rf "${BUILD_DIR}" "${DIST_DIR}"
+          mkdir -p "${DIST_DIR}"
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" \
+            cmake -S . -B "${BUILD_DIR}" -G Ninja \
+              -DBTOP_GPU=ON \
+              -DBTOP_STATIC=OFF \
+              -DBTOP_LTO=ON \
+              -DBUILD_TESTING=OFF \
+              -DBTOP_PACKAGE=ON \
+              -DBTOP_DEBIAN_PACKAGE_DEPENDS=libc6 \
+              -DGIT_COMMIT="${GIT_SHORT_SHA}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=/usr \
+              -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" \
+            cmake --build "${BUILD_DIR}" -j "$(nproc)"
+
+      - name: Package RPM
+        if: ${{ inputs.package_formats == 'both' || inputs.package_formats == 'rpm' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" \
+            cpack --config "${BUILD_DIR}/CPackConfig.cmake" -G RPM -B "${DIST_DIR}"
+
+      - name: Package DEB
+        if: ${{ inputs.package_formats == 'both' || inputs.package_formats == 'deb' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${MICROMAMBA}" run -p "${MICROMAMBA_ENV}" \
+            cpack --config "${BUILD_DIR}/CPackConfig.cmake" -G DEB -B "${DIST_DIR}"
+
+      - name: Inspect packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          ldd "${BUILD_DIR}/btop"
+          if compgen -G "${DIST_DIR}/btop-*.rpm" > /dev/null; then
+            rpm -qip "${DIST_DIR}"/btop-*.rpm
+            rpm -qpR "${DIST_DIR}"/btop-*.rpm | sort
+            rpm -Uvh --test --replacepkgs --oldpackage "${DIST_DIR}"/btop-*.rpm
+          fi
+          if compgen -G "${DIST_DIR}/btop_*.deb" > /dev/null; then
+            dpkg-deb -I "${DIST_DIR}"/btop_*.deb
+            dpkg-deb -c "${DIST_DIR}"/btop_*.deb | sed -n '1,80p'
+          fi
+          packages=()
+          while IFS= read -r -d '' package; do
+            packages+=("${package}")
+          done < <(find "${DIST_DIR}" -maxdepth 1 -type f \( -name '*.rpm' -o -name '*.deb' \) -print0 | sort -z)
+          if [[ "${#packages[@]}" -eq 0 ]]; then
+            echo "No package files found in ${DIST_DIR}" >&2
+            exit 1
+          fi
+          sha256sum "${packages[@]}" | tee "${DIST_DIR}/SHA256SUMS"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: btop-dcu-packages-${{ steps.version.outputs.git_short_sha }}
+          path: |
+            ${{ env.DIST_DIR }}/*.rpm
+            ${{ env.DIST_DIR }}/*.deb
+            ${{ env.DIST_DIR }}/SHA256SUMS
+          if-no-files-found: error
