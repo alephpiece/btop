@@ -173,9 +173,7 @@ namespace Term {
 
 			int gpu_layout_height = 0;
 			for (const int gpu_index : gpu_panels)
-				gpu_layout_height += (mem or net or proc)
-					? max(gpu_min_height(gpu_index), cpu_height)
-					: gpu_min_height(gpu_index);
+				gpu_layout_height += gpu_min_height(gpu_index);
 			const int other_min_height = proc
 				? Proc::min_height
 				: (mem ? Mem::min_height : 0) + (net ? Net::min_height : 0);

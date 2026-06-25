@@ -2412,9 +2412,7 @@ namespace Draw {
 				int height = 0;
 				width = Term::width;
 				if (Cpu::shown)
-					if (not (Mem::shown or Net::shown or Proc::shown))
-						height = min_height;
-					else height = Cpu::height;
+					height = min_height;
 				else
 					if (not (Mem::shown or Net::shown or Proc::shown))
 						height = (Term::height - total_height) / (Gpu::shown - i) + (i == 0) * ((Term::height - total_height) % (Gpu::shown - i));
