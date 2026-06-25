@@ -243,16 +243,23 @@ namespace Gpu {
 		#define RSMI_CLK_TYPE_MEM             4
 		#define RSMI_CLK_TYPE_SYS             0
 		#define RSMI_TEMP_MAX                 1
+		#define RSMI_IOLINK_TYPE_XGMI        2
+		#define RSMI_XHCL_LINK_TYPE_GPU      0
+		#define RSMI_XHCL_LINK_TYPE_SWITCH   1
+		#define RSMI_XHCL_LINK_ALL           255
+		#define RSMI_XHCL_BANDWIDTH_DELAY_MS 10
 
 		typedef int rsmi_status_t,
 					rsmi_temperature_metric_t,
 					rsmi_clk_type_t,
 					rsmi_memory_type_t;
+		typedef uint32_t rsmi_io_link_type_t;
 
 		struct rsmi_version_t {uint32_t major,  minor,  patch; const char* build;};
 		struct rsmi_frequencies_t_v5 {uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES_V5];};
 		struct rsmi_frequencies_t_v6 {bool has_deep_sleep; uint32_t num_supported, current; uint64_t frequency[RSMI_MAX_NUM_FREQUENCIES_V6];};
 		struct rsmi_pcie_bandwidth_info_t {double tx_bw, rx_bw, tx_rx_bw;};
+		struct rsmi_xhcl_bandwidth_info_t {double bw[hsl_link_count];};
 
 		//? Function pointers
 		rsmi_status_t (*rsmi_init)(uint64_t);
@@ -269,8 +276,13 @@ namespace Gpu {
 		rsmi_status_t (*rsmi_dev_power_ave_get)(uint32_t, uint32_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_memory_total_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_memory_usage_get)(uint32_t, rsmi_memory_type_t, uint64_t*);
+		rsmi_status_t (*rsmi_dev_pci_id_get)(uint32_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_pci_throughput_get)(uint32_t, uint64_t*, uint64_t*, uint64_t*);
 		rsmi_status_t (*rsmi_dev_pcie_bandwidth_get)(uint32_t, int, rsmi_pcie_bandwidth_info_t*);
+		rsmi_status_t (*rsmi_topo_get_link_type)(uint32_t, uint32_t, uint64_t*, rsmi_io_link_type_t*);
+		rsmi_status_t (*rsmi_dev_xhcl_bandwidth_get)(uint32_t, uint32_t, uint8_t, int, rsmi_xhcl_bandwidth_info_t*);
+		rsmi_status_t (*rsmi_dev_xhcl_link_remote_bdfid_get)(uint32_t, uint32_t, uint64_t*);
+		rsmi_status_t (*rsmi_dev_xhcl_link_remote_dev_type_get)(uint32_t, uint32_t, uint32_t*);
 
 		uint32_t version_major = 0;
 
@@ -281,6 +293,7 @@ namespace Gpu {
 		bool skip_temp_max = false;
 		bool query_pcie_speeds = true;
 		bool use_pcie_bandwidth = false;
+		bool use_xhcl_bandwidth = false;
 		bool init();
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
@@ -419,12 +432,16 @@ namespace Shared {
 			using namespace Gpu;
 			count = gpus.size();
 			gpu_b_height_offsets.resize(gpus.size());
-			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
+			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i) {
 				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
 					   + gpus[i].supported_functions.pwr_usage
 					   + (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
 					   + (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
+				if (gpus[i].supported_functions.hsl_txrx) {
+					gpu_b_height_offsets[i] = max(gpu_b_height_offsets[i], static_cast<int>(hsl_link_count));
+				}
+			}
 		}
 	#endif
 
@@ -1580,11 +1597,17 @@ namespace Gpu {
 			skip_temp_max = false;
 			query_pcie_speeds = true;
 			use_pcie_bandwidth = false;
+			use_xhcl_bandwidth = false;
 
 			//? Dynamic loading & linking
 		#if !defined(RSMI_STATIC)
 			rsmi_dev_pci_throughput_get = nullptr;
 			rsmi_dev_pcie_bandwidth_get = nullptr;
+			rsmi_dev_pci_id_get = nullptr;
+			rsmi_topo_get_link_type = nullptr;
+			rsmi_dev_xhcl_bandwidth_get = nullptr;
+			rsmi_dev_xhcl_link_remote_bdfid_get = nullptr;
+			rsmi_dev_xhcl_link_remote_dev_type_get = nullptr;
 
 			//? Try possible library paths and names for librocm_smi64.so
 			const array libRocAlts = {
@@ -1639,10 +1662,19 @@ namespace Gpu {
 				query_pcie_speeds = false;
 				rsmi_dev_pcie_bandwidth_get = (decltype(rsmi_dev_pcie_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_pcie_bandwidth_get");
 				use_pcie_bandwidth = rsmi_dev_pcie_bandwidth_get != nullptr;
+				rsmi_dev_pci_id_get = (decltype(rsmi_dev_pci_id_get))load_optional_rsmi_sym("rsmi_dev_pci_id_get");
+				rsmi_topo_get_link_type = (decltype(rsmi_topo_get_link_type))load_optional_rsmi_sym("rsmi_topo_get_link_type");
+				rsmi_dev_xhcl_bandwidth_get = (decltype(rsmi_dev_xhcl_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_xhcl_bandwidth_get");
+				rsmi_dev_xhcl_link_remote_bdfid_get = (decltype(rsmi_dev_xhcl_link_remote_bdfid_get))load_optional_rsmi_sym("rsmi_dev_xhcl_link_remote_bdfid_get");
+				rsmi_dev_xhcl_link_remote_dev_type_get = (decltype(rsmi_dev_xhcl_link_remote_dev_type_get))load_optional_rsmi_sym("rsmi_dev_xhcl_link_remote_dev_type_get");
+				use_xhcl_bandwidth = rsmi_topo_get_link_type != nullptr and rsmi_dev_xhcl_bandwidth_get != nullptr;
 				if (use_pcie_bandwidth) {
 					Logger::debug("ROCm SMI: detected Hygon compatibility library; skipping maximum GPU temperature and using fast PCIe bandwidth queries");
 				} else {
 					Logger::debug("ROCm SMI: detected Hygon compatibility library; skipping maximum GPU temperature and PCIe throughput queries");
+				}
+				if (use_xhcl_bandwidth) {
+					Logger::debug("ROCm SMI: detected Hygon xHCL bandwidth and topology APIs");
 				}
 			}
 
@@ -1757,10 +1789,114 @@ namespace Gpu {
 			return true;
 		}
 
+		#if !defined(RSMI_STATIC)
+		void reset_xhcl_bandwidth(gpu_info& gpu) {
+			gpu.hsl_tx.fill(-1);
+			gpu.hsl_rx.fill(-1);
+		}
+
+		void reset_xhcl_labels(gpu_info& gpu) {
+			gpu.hsl_label.fill("?");
+		}
+
+		long long mbps_to_kbps(double value) {
+			if (not std::isfinite(value) or value < 0.0) return -1;
+			return static_cast<long long>(std::llround(value * 1000.0));
+		}
+
+		int find_xhcl_peer_by_bdf(uint64_t remote_bdfid) {
+			if (rsmi_dev_pci_id_get == nullptr) return -1;
+
+			for (uint32_t peer = 0; peer < device_count; ++peer) {
+				uint64_t peer_bdfid = 0;
+				const auto result = rsmi_dev_pci_id_get(peer, &peer_bdfid);
+				if (result == RSMI_STATUS_SUCCESS and peer_bdfid == remote_bdfid) {
+					return static_cast<int>(peer);
+				}
+			}
+
+			return -1;
+		}
+
+		int detect_xhcl_link_labels(gpu_info& gpu, uint32_t index) {
+			reset_xhcl_labels(gpu);
+			if (rsmi_dev_xhcl_link_remote_dev_type_get == nullptr) return static_cast<int>(hsl_link_count);
+
+			int active_links = 0;
+			for (uint32_t link = 0; link < hsl_link_count; ++link) {
+				uint32_t remote_type = 0;
+				const auto type_result = rsmi_dev_xhcl_link_remote_dev_type_get(index, link, &remote_type);
+				if (type_result != RSMI_STATUS_SUCCESS) continue;
+
+				if (remote_type == RSMI_XHCL_LINK_TYPE_SWITCH) {
+					active_links++;
+					gpu.hsl_label[link] = "*";
+				} else if (remote_type == RSMI_XHCL_LINK_TYPE_GPU) {
+					active_links++;
+					if (rsmi_dev_xhcl_link_remote_bdfid_get == nullptr) continue;
+
+					uint64_t remote_bdfid = 0;
+					const auto bdf_result = rsmi_dev_xhcl_link_remote_bdfid_get(index, link, &remote_bdfid);
+					if (bdf_result != RSMI_STATUS_SUCCESS) continue;
+
+					const int peer = find_xhcl_peer_by_bdf(remote_bdfid);
+					if (peer >= 0 and peer < 10) {
+						gpu.hsl_label[link] = to_string(peer);
+					}
+				}
+			}
+
+			return active_links;
+		}
+
+		void detect_xhcl_peers(gpu_info& gpu, uint32_t index) {
+			gpu.hsl_peers.clear();
+			gpu.hsl_active_links = 0;
+			gpu.supported_functions.hsl_txrx = false;
+			reset_xhcl_bandwidth(gpu);
+			reset_xhcl_labels(gpu);
+
+			if (not use_xhcl_bandwidth) return;
+
+			for (uint32_t peer = 0; peer < device_count; ++peer) {
+				if (peer == index) continue;
+
+				uint64_t hops = 0;
+				rsmi_io_link_type_t type = 0;
+				const auto result = rsmi_topo_get_link_type(index, peer, &hops, &type);
+				if (result == RSMI_STATUS_SUCCESS and type == RSMI_IOLINK_TYPE_XGMI) {
+					gpu.hsl_peers.push_back(static_cast<int>(peer));
+				}
+			}
+
+			gpu.supported_functions.hsl_txrx = not gpu.hsl_peers.empty();
+			if (gpu.supported_functions.hsl_txrx) {
+				gpu.hsl_active_links = detect_xhcl_link_labels(gpu, index);
+			}
+		}
+
+		void collect_xhcl_bandwidth(gpu_info& gpu, uint32_t index) {
+			if (not gpu.supported_functions.hsl_txrx) return;
+
+			rsmi_xhcl_bandwidth_info_t rx{};
+			rsmi_xhcl_bandwidth_info_t tx{};
+			const auto rx_result = rsmi_dev_xhcl_bandwidth_get(index, RSMI_XHCL_LINK_ALL, 0, RSMI_XHCL_BANDWIDTH_DELAY_MS, &rx);
+			const auto tx_result = rsmi_dev_xhcl_bandwidth_get(index, RSMI_XHCL_LINK_ALL, 1, RSMI_XHCL_BANDWIDTH_DELAY_MS, &tx);
+
+			for (size_t link = 0; link < hsl_link_count; ++link) {
+				gpu.hsl_rx[link] = rx_result == RSMI_STATUS_SUCCESS ? mbps_to_kbps(rx.bw[link]) : -1;
+				gpu.hsl_tx[link] = tx_result == RSMI_STATUS_SUCCESS ? mbps_to_kbps(tx.bw[link]) : -1;
+			}
+		}
+		#endif
+
 		template <bool is_init>
 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count, offset by Nvml::device_count elements
 			if (!initialized) return false;
 			rsmi_status_t result;
+			#if !defined(RSMI_STATIC)
+			const bool sample_xhcl = use_xhcl_bandwidth;
+			#endif
 
 			for (uint32_t i = 0; i < device_count; ++i) {
 				if constexpr(is_init) {
@@ -1793,6 +1929,9 @@ namespace Gpu {
 					//? Disable encoder and decoder utilisation on AMD
 					gpus_slice[i].supported_functions.encoder_utilization = false;
 					gpus_slice[i].supported_functions.decoder_utilization = false;
+					#if !defined(RSMI_STATIC)
+					detect_xhcl_peers(gpus_slice[i], i);
+					#endif
     			}
 
 				//? GPU utilization
@@ -1996,8 +2135,13 @@ namespace Gpu {
 					gpus_slice[i].pcie_tx = -1;
 					gpus_slice[i].pcie_rx = -1;
 				}
-    		}
 
+				#if !defined(RSMI_STATIC)
+				if (sample_xhcl) {
+					collect_xhcl_bandwidth(gpus_slice[i], i);
+				}
+				#endif
+			}
 			return true;
 		}
 	}

@@ -1000,6 +1000,8 @@ namespace Cpu {
 namespace Gpu {
 	int width_p = 100, height_p = 32;
 	int min_width = 41, min_height = 8;
+	constexpr int hsl_box_width = 32;
+	constexpr int hsl_box_height = 9;
 	int width = 41, total_height;
 	vector<int> x_vec = {}, y_vec = {}, b_height_vec = {};
 	int b_width;
@@ -1043,6 +1045,10 @@ namespace Gpu {
         auto single_graph = !Config::getB("gpu_mirror_graph");
 		string out;
 		int height = gpu_b_height_offsets[index] + 4;
+		const bool show_hsl = gpu.supported_functions.hsl_txrx and height >= hsl_box_height + 2 and width >= b_width + hsl_box_width + 8;
+		const int hsl_x = b_x - hsl_box_width - 1;
+		const int hsl_y = b_y;
+		const int gpu_graph_width = show_hsl ? max(1, hsl_x - x - 2) : x + width - b_width - 3;
 		out.reserve(width * height);
 
 		//* Redraw elements not needed to be updated every cycle
@@ -1053,14 +1059,14 @@ namespace Gpu {
 			int graph_low_height = single_graph ? 0 : b_height_vec[index] - graph_up_height;
 
 			if (gpu.supported_functions.gpu_utilization) {
-				graph_upper = Draw::Graph{x + width - b_width - 3, graph_up_height, "cpu", safeVal(gpu.gpu_percent, "gpu-totals"s), graph_symbol, false, true}; // TODO cpu -> gpu
+				graph_upper = Draw::Graph{gpu_graph_width, graph_up_height, "cpu", safeVal(gpu.gpu_percent, "gpu-totals"s), graph_symbol, false, true}; // TODO cpu -> gpu
             	if (not single_graph) {
                 	graph_lower = Draw::Graph{
-                    	x + width - b_width - 3,
-                    	graph_low_height, "cpu",
-                    	safeVal(gpu.gpu_percent, "gpu-totals"s),
-                    	graph_symbol,
-                    	Config::getB("cpu_invert_lower"), true
+						gpu_graph_width,
+						graph_low_height, "cpu",
+						safeVal(gpu.gpu_percent, "gpu-totals"s),
+						graph_symbol,
+						Config::getB("cpu_invert_lower"), true
                 	};
             	}
 				gpu_meter = Draw::Meter{b_width - (show_temps ? 25 : 12), "cpu"};
@@ -1098,6 +1104,27 @@ namespace Gpu {
 			}
 			out += Theme::c("div_line") + Symbols::v_line;
 			rows_used++;
+		}
+
+		//? Hygon HSL link throughput
+		if (show_hsl) {
+			auto hsl_value_string = [](long long value) {
+				return value < 0 ? "N/A"s : floating_humanizer(static_cast<uint64_t>(value), false, 1, false, true);
+			};
+			const string enabled_title = fmt::format("{}/{}", gpu.hsl_active_links, gpu.hsl_peers.size());
+			out += Draw::createBox(hsl_x, hsl_y, hsl_box_width, hsl_box_height, "", false, "HSL");
+			out += Mv::to(hsl_y, hsl_x + hsl_box_width - static_cast<int>(enabled_title.size()) - 4)
+				+ Theme::c("div_line") + Symbols::title_left + Fx::b + Theme::c("title") + enabled_title + Fx::ub
+				+ Theme::c("div_line") + Symbols::title_right;
+
+			for (size_t link = 0; link < hsl_link_count; ++link) {
+				const string tx_string = hsl_value_string(gpu.hsl_tx[link]);
+				const string rx_string = hsl_value_string(gpu.hsl_rx[link]);
+				out += Mv::to(hsl_y + 1 + static_cast<int>(link), hsl_x + 2)
+					+ Theme::c("main_fg") + rjust(gpu.hsl_label[link], 1)
+					+ " " + Theme::c("title") + Fx::b + "TX " + Fx::ub + Theme::c("main_fg") + rjust(tx_string, 10)
+					+ " " + Theme::c("title") + Fx::b + "RX " + Fx::ub + Theme::c("main_fg") + rjust(rx_string, 10);
+			}
 		}
 
 		if (gpu.supported_functions.gpu_clock) {

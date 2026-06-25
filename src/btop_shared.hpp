@@ -125,6 +125,7 @@ namespace Gpu {
 	extern std::unordered_map<string, deque<long long>> shared_gpu_percent; // averages, power/vram total
 
 	const array mem_names { "used"s, "free"s };
+	constexpr size_t hsl_link_count = 7;
 
 	//* Container for process information // TODO
 	/*struct proc_info {
@@ -144,6 +145,7 @@ namespace Gpu {
 				 mem_total = true,
 				 mem_used = true,
 				 pcie_txrx = true,
+				 hsl_txrx = false,
 				 encoder_utilization = true,
 				 decoder_utilization = true;
 	};
@@ -171,6 +173,12 @@ namespace Gpu {
 
 		long long pcie_tx = 0; // KB/s
 		long long pcie_rx = 0;
+
+		array<long long, hsl_link_count> hsl_tx = {-1, -1, -1, -1, -1, -1, -1}; // KB/s
+		array<long long, hsl_link_count> hsl_rx = {-1, -1, -1, -1, -1, -1, -1};
+		array<string, hsl_link_count> hsl_label = {"?", "?", "?", "?", "?", "?", "?"};
+		vector<int> hsl_peers;
+		int hsl_active_links = 0;
 
 		long long encoder_utilization = 0;
 		long long decoder_utilization = 0;
