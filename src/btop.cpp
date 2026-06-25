@@ -523,6 +523,7 @@ namespace Runner {
 
 				vector<Gpu::gpu_info> gpus;
 				if (gpu_in_cpu_panel or not gpu_panels.empty()) {
+					Gpu::update_hsl_sample_visibility(gpu_panels);
 					if (Global::debug) debug_timer("gpu", collect_begin);
 					gpus = Gpu::collect(conf.no_update);
 					if (Global::debug) debug_timer("gpu", collect_done);

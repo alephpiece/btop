@@ -1019,6 +1019,23 @@ namespace Gpu {
 	vector<Draw::Meter> enc_meter_vec = {};
 	vector<string> box = {};
 
+	bool hsl_box_fits(unsigned long panel_slot, unsigned long gpu_index) {
+		if (gpu_index >= gpu_b_height_offsets.size() or panel_slot >= x_vec.size() or panel_slot >= b_x_vec.size()) return false;
+
+		const int height = gpu_b_height_offsets[gpu_index] + 4;
+		return height >= hsl_box_height + 2 and width >= b_width + hsl_box_width + 8;
+	}
+
+	void update_hsl_sample_visibility(const vector<unsigned int>& gpu_panels) {
+		hsl_sample_visible.assign(static_cast<size_t>(max(count, 0)), false);
+		for (unsigned long panel_slot = 0; panel_slot < gpu_panels.size(); ++panel_slot) {
+			const auto gpu_index = gpu_panels[panel_slot];
+			if (gpu_index < hsl_sample_visible.size() and hsl_box_fits(panel_slot, gpu_index)) {
+				hsl_sample_visible[gpu_index] = true;
+			}
+		}
+	}
+
     string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same) {
 		if (Runner::stopping) return "";
 
@@ -1037,6 +1054,7 @@ namespace Gpu {
 		auto& enc_meter = enc_meter_vec[index];
 
 		if (force_redraw) redraw[index] = true;
+		const auto gpu_index = shown_panels[index];
         bool show_temps = gpu.supported_functions.temp_info and (Config::getB("check_temp"));
         auto tty_mode = Config::getB("tty_mode");
 		auto& temp_scale = Config::getS("temp_scale");
@@ -1044,8 +1062,8 @@ namespace Gpu {
 		auto& graph_bg = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(6);
         auto single_graph = !Config::getB("gpu_mirror_graph");
 		string out;
-		int height = gpu_b_height_offsets[index] + 4;
-		const bool show_hsl = gpu.supported_functions.hsl_txrx and height >= hsl_box_height + 2 and width >= b_width + hsl_box_width + 8;
+		const int height = gpu_b_height_offsets[gpu_index] + 4;
+		const bool show_hsl = gpu.supported_functions.hsl_txrx and hsl_box_fits(index, gpu_index);
 		const int hsl_x = b_x - hsl_box_width - 1;
 		const int hsl_y = b_y;
 		const int gpu_graph_width = show_hsl ? max(1, hsl_x - x - 2) : x + width - b_width - 3;

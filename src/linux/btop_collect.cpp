@@ -1888,15 +1888,20 @@ namespace Gpu {
 				gpu.hsl_tx[link] = tx_result == RSMI_STATUS_SUCCESS ? mbps_to_kbps(tx.bw[link]) : -1;
 			}
 		}
+
+		bool should_collect_xhcl_bandwidth(const gpu_info& gpu, uint32_t index) {
+			const size_t gpu_index = Nvml::device_count + index;
+			return use_xhcl_bandwidth
+				and gpu.supported_functions.hsl_txrx
+				and gpu_index < hsl_sample_visible.size()
+				and hsl_sample_visible[gpu_index];
+		}
 		#endif
 
 		template <bool is_init>
 		bool collect(gpu_info* gpus_slice) { // raw pointer to vector data, size == device_count, offset by Nvml::device_count elements
 			if (!initialized) return false;
 			rsmi_status_t result;
-			#if !defined(RSMI_STATIC)
-			const bool sample_xhcl = use_xhcl_bandwidth;
-			#endif
 
 			for (uint32_t i = 0; i < device_count; ++i) {
 				if constexpr(is_init) {
@@ -2137,7 +2142,7 @@ namespace Gpu {
 				}
 
 				#if !defined(RSMI_STATIC)
-				if (sample_xhcl) {
+				if (should_collect_xhcl_bandwidth(gpus_slice[i], i)) {
 					collect_xhcl_bandwidth(gpus_slice[i], i);
 				}
 				#endif

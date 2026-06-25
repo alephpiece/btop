@@ -120,6 +120,7 @@ namespace Gpu {
 	extern vector<int> shown_panels;
 	extern vector<string> gpu_names;
 	extern vector<int> gpu_b_height_offsets;
+	extern vector<bool> hsl_sample_visible;
 	extern long long gpu_pwr_total_max;
 
 	extern std::unordered_map<string, deque<long long>> shared_gpu_percent; // averages, power/vram total
@@ -206,6 +207,9 @@ namespace Gpu {
 
 	//* Collect gpu stats and temperatures
     auto collect(bool no_update = false) -> vector<gpu_info>&;
+
+	//* Update which GPU panels can currently show HSL bandwidth
+	void update_hsl_sample_visibility(const vector<unsigned int>& gpu_panels);
 
 	//* Draw contents of gpu box using <gpus> as source
   	string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same);
