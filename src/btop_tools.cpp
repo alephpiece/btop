@@ -127,10 +127,9 @@ namespace Term {
 			std::istringstream iss(boxes, std::istringstream::in);
 			string current;
 			while (iss >> current) {
-				if (current.starts_with("gpu") and current.size() == 4) {
-					const int gpu_index = current[3] - '0';
-					if (gpu_index >= 0 and gpu_index < Gpu::count)
-						gpu_panels.push_back(gpu_index);
+				if (const auto gpu_index = Config::gpu_box_index(current); gpu_index.has_value()) {
+					if (std::cmp_less(*gpu_index, Gpu::count))
+						gpu_panels.push_back(static_cast<int>(*gpu_index));
 				}
 			}
 		}
