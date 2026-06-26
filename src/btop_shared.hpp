@@ -174,6 +174,7 @@ namespace Gpu {
 
 		long long pcie_tx = 0; // KB/s
 		long long pcie_rx = 0;
+		string bus_id;
 
 		array<long long, hsl_link_count> hsl_tx = {-1, -1, -1, -1, -1, -1, -1}; // KB/s
 		array<long long, hsl_link_count> hsl_rx = {-1, -1, -1, -1, -1, -1, -1};

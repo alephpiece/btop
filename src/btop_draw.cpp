@@ -1041,6 +1041,45 @@ namespace Gpu {
 		}
 	}
 
+	string gpu_model_title(size_t gpu_index, int max_width) {
+		if (gpu_index >= gpu_names.size() or max_width <= 0) return "";
+
+		const string custom_name_key = "custom_gpu_name" + to_string(gpu_index);
+		const std::string_view custom_name_key_view{custom_name_key};
+		string name = Config::strings.contains(custom_name_key_view) ? Config::getS(custom_name_key_view) : "";
+		if (name.empty()) name = gpu_names[gpu_index];
+
+		return uresize(name, max_width);
+	}
+
+	string gpu_bus_id_without_domain(std::string_view bus_id) {
+		const size_t first_colon = bus_id.find(':');
+		if (first_colon == string::npos) return string{bus_id};
+
+		const size_t second_colon = bus_id.find(':', first_colon + 1);
+		if (second_colon == string::npos) return string{bus_id};
+
+		return string{bus_id.substr(first_colon + 1)};
+	}
+
+	string gpu_bus_id_title(const gpu_info& gpu, const string& model_title, int box_x, int box_y, int box_width) {
+		if (gpu.bus_id.empty()) return "";
+
+		const int model_title_end = box_x + 3 + static_cast<int>(ulen(model_title));
+		const int bus_x = model_title_end + 1;
+		const int clock_start = box_x + box_width - 12;
+		const array bus_ids = {gpu.bus_id, gpu_bus_id_without_domain(gpu.bus_id)};
+		for (const auto& bus_id : bus_ids) {
+			const int bus_width = 3 + static_cast<int>(ulen(bus_id));
+			if (bus_x + bus_width > clock_start) continue;
+
+			return Mv::to(box_y, bus_x) + Theme::c("div_line") + Symbols::h_line + Symbols::title_left + Fx::b
+				+ Theme::c("title") + bus_id + Fx::ub + Theme::c("div_line") + Symbols::title_right;
+		}
+
+		return "";
+	}
+
     string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same) {
 		if (Runner::stopping) return "";
 
@@ -1077,6 +1116,7 @@ namespace Gpu {
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw[index]) {
 			out += box[index];
+			out += gpu_bus_id_title(gpu, gpu_model_title(gpu_index, b_width - 5), b_x, b_y, b_width);
 
 			graph_up_height = single_graph ? b_height_vec[index] : (b_height_vec[index] + 1) / 2;
 			int graph_low_height = single_graph ? 0 : b_height_vec[index] - graph_up_height;
@@ -2451,12 +2491,7 @@ namespace Draw {
 				b_x_vec[i] = x_vec[i] + width - b_width - 1;
 				b_y_vec[i] = y_vec[i] + ceil((double)(height - 2 - b_height_vec[i]) / 2) + 1;
 
-				const string custom_name_key = "custom_gpu_name" + to_string(shown_panels[i]);
-				const std::string_view custom_name_key_view{custom_name_key};
-				string name = Config::strings.contains(custom_name_key_view) ? Config::getS(custom_name_key_view) : "";
-				if (name.empty()) name = gpu_names[shown_panels[i]];
-
-				box[i] += createBox(b_x_vec[i], b_y_vec[i], b_width, b_height_vec[i], "", false, name.substr(0, b_width-5));
+				box[i] += createBox(b_x_vec[i], b_y_vec[i], b_width, b_height_vec[i], "", false, gpu_model_title(shown_panels[i], b_width - 5));
 				b_height_vec[i] = height - 2;
 			}
 		}

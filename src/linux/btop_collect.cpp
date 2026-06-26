@@ -1657,12 +1657,12 @@ namespace Gpu {
 			};
 
 			const bool is_hygon_rsmi = has_rsmi_sym("rsmi_hy_version_get");
+			rsmi_dev_pci_id_get = (decltype(rsmi_dev_pci_id_get))load_optional_rsmi_sym("rsmi_dev_pci_id_get");
 			if (is_hygon_rsmi) {
 				skip_temp_max = true;
 				query_pcie_speeds = false;
 				rsmi_dev_pcie_bandwidth_get = (decltype(rsmi_dev_pcie_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_pcie_bandwidth_get");
 				use_pcie_bandwidth = rsmi_dev_pcie_bandwidth_get != nullptr;
-				rsmi_dev_pci_id_get = (decltype(rsmi_dev_pci_id_get))load_optional_rsmi_sym("rsmi_dev_pci_id_get");
 				rsmi_topo_get_link_type = (decltype(rsmi_topo_get_link_type))load_optional_rsmi_sym("rsmi_topo_get_link_type");
 				rsmi_dev_xhcl_bandwidth_get = (decltype(rsmi_dev_xhcl_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_xhcl_bandwidth_get");
 				rsmi_dev_xhcl_link_remote_bdfid_get = (decltype(rsmi_dev_xhcl_link_remote_bdfid_get))load_optional_rsmi_sym("rsmi_dev_xhcl_link_remote_bdfid_get");
@@ -1804,6 +1804,20 @@ namespace Gpu {
 			return static_cast<long long>(std::llround(value * 1000.0));
 		}
 
+		string format_bdfid(uint64_t bdfid) {
+			return fmt::format("{:04x}:{:02x}:{:02x}.{}", (bdfid >> 32) & 0xffffffff, (bdfid >> 8) & 0xff, (bdfid >> 3) & 0x1f, bdfid & 0x7);
+		}
+
+		void set_bus_id(gpu_info& gpu, uint32_t index) {
+			if (rsmi_dev_pci_id_get == nullptr) return;
+
+			uint64_t bdfid = 0;
+			const auto result = rsmi_dev_pci_id_get(index, &bdfid);
+			if (result == RSMI_STATUS_SUCCESS) {
+				gpu.bus_id = format_bdfid(bdfid);
+			}
+		}
+
 		int find_xhcl_peer_by_bdf(uint64_t remote_bdfid) {
 			if (rsmi_dev_pci_id_get == nullptr) return -1;
 
@@ -1935,6 +1949,7 @@ namespace Gpu {
 					gpus_slice[i].supported_functions.encoder_utilization = false;
 					gpus_slice[i].supported_functions.decoder_utilization = false;
 					#if !defined(RSMI_STATIC)
+					set_bus_id(gpus_slice[i], i);
 					detect_xhcl_peers(gpus_slice[i], i);
 					#endif
     			}
