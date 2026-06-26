@@ -228,6 +228,7 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlDeviceGetPowerState)(nvmlDevice_t, nvmlPstates_t*);
 		nvmlReturn_t (*nvmlDeviceGetTemperature)(nvmlDevice_t, nvmlTemperatureSensors_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
+		nvmlReturn_t (*nvmlDeviceGetMemoryBusWidth)(nvmlDevice_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetPcieThroughput)(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
@@ -1339,6 +1340,13 @@ namespace Gpu {
 				} else return sym;
 			};
 
+			auto load_optional_nvml_sym = [&](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(nvml_dl_handle, sym_name);
+				auto err = dlerror();
+				return err == nullptr ? sym : nullptr;
+			};
+
             #define LOAD_SYM(NAME)  if ((NAME = (decltype(NAME))load_nvml_sym(#NAME)) == nullptr) return false
 
 		    LOAD_SYM(nvmlErrorString);
@@ -1360,6 +1368,7 @@ namespace Gpu {
 			LOAD_SYM(nvmlDeviceGetDecoderUtilization);
 
             #undef LOAD_SYM
+			nvmlDeviceGetMemoryBusWidth = (decltype(nvmlDeviceGetMemoryBusWidth))load_optional_nvml_sym("nvmlDeviceGetMemoryBusWidth");
 
 			//? Function calls
 			nvmlReturn_t result = nvmlInit();
@@ -1431,22 +1440,35 @@ namespace Gpu {
 						gpu_names[i] = trim(gpu_names[i]);
         			}
 
-    				//? Power usage
-    				unsigned int max_power;
-    				result = nvmlDeviceGetPowerManagementLimit(devices[i], &max_power);
-    				if (result != NVML_SUCCESS)
+					//? Power usage
+					unsigned int max_power;
+					result = nvmlDeviceGetPowerManagementLimit(devices[i], &max_power);
+					if (result != NVML_SUCCESS) {
 						Logger::warning("NVML: Failed to get maximum GPU power draw, defaulting to 225W: {}", nvmlErrorString(result));
-					else {
+					} else {
 						gpus[i].pwr_max_usage = max_power; // RSMI reports power in microWatts
 						gpu_pwr_total_max += max_power;
 					}
 
 					//? Get temp_max
 					unsigned int temp_max;
-    				result = nvmlDeviceGetTemperatureThreshold(devices[i], NVML_TEMPERATURE_THRESHOLD_SHUTDOWN, &temp_max);
-        			if (result != NVML_SUCCESS)
-    					Logger::warning("NVML: Failed to get maximum GPU temperature, defaulting to 110°C: {}", nvmlErrorString(result));
-    				else gpus[i].temp_max = (long long)temp_max;
+					result = nvmlDeviceGetTemperatureThreshold(devices[i], NVML_TEMPERATURE_THRESHOLD_SHUTDOWN, &temp_max);
+					if (result != NVML_SUCCESS) {
+						Logger::warning("NVML: Failed to get maximum GPU temperature, defaulting to 110°C: {}", nvmlErrorString(result));
+					} else {
+						gpus[i].temp_max = (long long)temp_max;
+					}
+
+					//? Static memory bus width
+					if (nvmlDeviceGetMemoryBusWidth != nullptr) {
+						unsigned int memory_bus_width = 0;
+						result = nvmlDeviceGetMemoryBusWidth(devices[i], &memory_bus_width);
+						if (result != NVML_SUCCESS) {
+							Logger::debug("NVML: Failed to get VRAM bus width: {}", nvmlErrorString(result));
+						} else {
+							gpus[i].vram_bit_width = memory_bus_width;
+						}
+					}
 				}
 
 				//? PCIe link speeds, the data collection takes >=20ms each call so they run on separate threads

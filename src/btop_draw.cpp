@@ -1119,6 +1119,18 @@ namespace Gpu {
 			}
 		}
 
+		if (gpu.vram_bit_width > 0) {
+			const array candidates = {
+				fmt::format("vram {}-bit", gpu.vram_bit_width),
+				fmt::format("vram {}b", gpu.vram_bit_width),
+				"vram"s
+			};
+
+			for (const auto& candidate : candidates) {
+				if (static_cast<int>(ulen(candidate)) <= max_width) return candidate;
+			}
+		}
+
 		return static_cast<int>(ulen("vram")) <= max_width ? "vram" : uresize("vram", max_width);
 	}
 
