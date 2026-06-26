@@ -232,6 +232,9 @@ void clean_quit(int sig) {
 	Gpu::Nvml::shutdown();
 	Gpu::Rsmi::shutdown();
 	Gpu::Asysfs::shutdown();
+	#ifdef __linux__
+	Gpu::AmdDrm::shutdown();
+	#endif
 	#ifdef __APPLE__
 	Gpu::AppleSilicon::shutdown();
 	#endif

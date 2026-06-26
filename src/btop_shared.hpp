@@ -175,6 +175,9 @@ namespace Gpu {
 		long long pcie_tx = 0; // KB/s
 		long long pcie_rx = 0;
 		string bus_id;
+		string vram_type;
+		uint32_t vram_bit_width = 0;
+		uint32_t cu_active_number = 0;
 
 		array<long long, hsl_link_count> hsl_tx = {-1, -1, -1, -1, -1, -1, -1}; // KB/s
 		array<long long, hsl_link_count> hsl_rx = {-1, -1, -1, -1, -1, -1, -1};
@@ -200,6 +203,11 @@ namespace Gpu {
 	namespace Asysfs {
 		extern bool shutdown();
 	}
+	#ifdef __linux__
+	namespace AmdDrm {
+		extern bool shutdown();
+	}
+	#endif
 	#ifdef __APPLE__
 	namespace AppleSilicon {
 		extern bool shutdown();

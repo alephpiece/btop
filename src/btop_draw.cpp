@@ -1062,22 +1062,64 @@ namespace Gpu {
 		return string{bus_id.substr(first_colon + 1)};
 	}
 
-	string gpu_bus_id_title(const gpu_info& gpu, const string& model_title, int box_x, int box_y, int box_width) {
-		if (gpu.bus_id.empty()) return "";
+	string gpu_title_metadata(const gpu_info& gpu, const string& model_title, int box_x, int box_y, int box_width) {
+		if (gpu.cu_active_number == 0 and gpu.bus_id.empty()) return "";
 
 		const int model_title_end = box_x + 3 + static_cast<int>(ulen(model_title));
-		const int bus_x = model_title_end + 1;
-		const int clock_start = box_x + box_width - 12;
-		const array bus_ids = {gpu.bus_id, gpu_bus_id_without_domain(gpu.bus_id)};
-		for (const auto& bus_id : bus_ids) {
-			const int bus_width = 3 + static_cast<int>(ulen(bus_id));
-			if (bus_x + bus_width > clock_start) continue;
+		const int metadata_x = model_title_end + 1;
+		const int metadata_end = gpu.supported_functions.gpu_clock ? box_x + box_width - 12 : box_x + box_width - 1;
+		vector<vector<string>> candidates;
 
-			return Mv::to(box_y, bus_x) + Theme::c("div_line") + Symbols::h_line + Symbols::title_left + Fx::b
-				+ Theme::c("title") + bus_id + Fx::ub + Theme::c("div_line") + Symbols::title_right;
+		const string cu_string = gpu.cu_active_number > 0 ? fmt::format("{} CU", gpu.cu_active_number) : "";
+		if (not cu_string.empty() and not gpu.bus_id.empty()) {
+			candidates.push_back({cu_string, gpu.bus_id});
+			candidates.push_back({cu_string, gpu_bus_id_without_domain(gpu.bus_id)});
+			candidates.push_back({cu_string});
+		} else if (not cu_string.empty()) {
+			candidates.push_back({cu_string});
+		} else if (not gpu.bus_id.empty()) {
+			candidates.push_back({gpu.bus_id});
+			candidates.push_back({gpu_bus_id_without_domain(gpu.bus_id)});
+		}
+
+		auto segment_width = [](const string& segment) {
+			return 3 + static_cast<int>(ulen(segment));
+		};
+
+		for (const auto& segments : candidates) {
+			int total_width = 0;
+			for (const auto& segment : segments) total_width += segment_width(segment);
+			if (metadata_x + total_width > metadata_end) continue;
+
+			string out;
+			int x = metadata_x;
+			for (const auto& segment : segments) {
+				out += Mv::to(box_y, x) + Theme::c("div_line") + Symbols::h_line + Symbols::title_left + Fx::b
+					+ Theme::c("title") + segment + Fx::ub + Theme::c("div_line") + Symbols::title_right;
+				x += segment_width(segment);
+			}
+			return out;
 		}
 
 		return "";
+	}
+
+	string gpu_vram_title(const gpu_info& gpu, int max_width) {
+		if (max_width <= 0) return "";
+
+		if (not gpu.vram_type.empty() and gpu.vram_bit_width > 0) {
+			const array candidates = {
+				fmt::format("{} {}-bit", gpu.vram_type, gpu.vram_bit_width),
+				fmt::format("{} {}b", gpu.vram_type, gpu.vram_bit_width),
+				gpu.vram_type
+			};
+
+			for (const auto& candidate : candidates) {
+				if (static_cast<int>(ulen(candidate)) <= max_width) return candidate;
+			}
+		}
+
+		return static_cast<int>(ulen("vram")) <= max_width ? "vram" : uresize("vram", max_width);
 	}
 
     string draw(const gpu_info& gpu, unsigned long index, bool force_redraw, bool data_same) {
@@ -1116,7 +1158,7 @@ namespace Gpu {
 		//* Redraw elements not needed to be updated every cycle
 		if (redraw[index]) {
 			out += box[index];
-			out += gpu_bus_id_title(gpu, gpu_model_title(gpu_index, b_width - 5), b_x, b_y, b_width);
+			out += gpu_title_metadata(gpu, gpu_model_title(gpu_index, b_width - 5), b_x, b_y, b_width);
 
 			graph_up_height = single_graph ? b_height_vec[index] : (b_height_vec[index] + 1) / 2;
 			int graph_low_height = single_graph ? 0 : b_height_vec[index] - graph_up_height;
@@ -1224,9 +1266,13 @@ namespace Gpu {
 				auto offset = (gpu.supported_functions.mem_total or gpu.supported_functions.mem_used)
 					* (1 + 2*(gpu.supported_functions.mem_total and gpu.supported_functions.mem_used) + 2*gpu.supported_functions.mem_utilization);
 
+				const int vram_title_max_width = max(0, b_width / 2 - 4);
+				const string vram_title = gpu_vram_title(gpu, vram_title_max_width);
+				const int vram_title_hline = max(0, b_width / 2 - 4 - static_cast<int>(ulen(vram_title)));
+
 				//? Used graph, memory section header, total vram
-				out += Theme::c("div_line") + Symbols::div_left + Symbols::h_line + Symbols::title_left + Fx::b + Theme::c("title") + "vram" + Theme::c("div_line") + Fx::ub + Symbols::title_right
-					+  Symbols::h_line*(b_width/2-8) + Symbols::div_up + Mv::d(offset)+Mv::l(1) + Symbols::div_down + Mv::l(1)+Mv::u(1) + (Symbols::v_line + Mv::l(1)+Mv::u(1))*(offset-1) + Symbols::div_up
+				out += Theme::c("div_line") + Symbols::div_left + Symbols::h_line + Symbols::title_left + Fx::b + Theme::c("title") + vram_title + Theme::c("div_line") + Fx::ub + Symbols::title_right
+					+  Symbols::h_line*vram_title_hline + Symbols::div_up + Mv::d(offset)+Mv::l(1) + Symbols::div_down + Mv::l(1)+Mv::u(1) + (Symbols::v_line + Mv::l(1)+Mv::u(1))*(offset-1) + Symbols::div_up
 					+  Symbols::h_line + Theme::c("title") + "Used:" + Theme::c("div_line")
 					+  Symbols::h_line*(b_width/2+b_width%2-9-used_memory_string.size()) + Theme::c("title") + used_memory_string + Theme::c("div_line") + Symbols::h_line + Symbols::div_right
 					+  Mv::d(1) + Mv::l(b_width/2-1) + mem_used_graph(safeVal(gpu.gpu_percent, "gpu-vram-totals"s), (data_same or redraw[index]))

@@ -34,6 +34,7 @@ tab-size = 4
 
 #include <arpa/inet.h> // for inet_ntop()
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
@@ -175,6 +176,20 @@ namespace Cpu {
 
 namespace Gpu {
 	vector<gpu_info> gpus;
+
+	string normalize_bdf(string bdf) {
+		return str_to_lower(std::move(bdf));
+	}
+
+	string bdf_from_sysfs_device_link(const fs::path& device_link) {
+		std::error_code ec;
+		const auto target = fs::read_symlink(device_link, ec);
+		if (ec) return "";
+
+		const string bdf = target.filename().string();
+		return bdf.contains(':') and bdf.contains('.') ? normalize_bdf(bdf) : "";
+	}
+
 	//? NVIDIA data collection
 	namespace Nvml {
 		//? NVML defines, structs & typedefs
@@ -300,6 +315,12 @@ namespace Gpu {
 		uint32_t device_count = 0;
 	}
 
+	namespace AmdDrm {
+		bool init();
+		bool shutdown();
+		void apply_static_info(vector<gpu_info>& gpus);
+	}
+
 
 	//? Intel data collection
 	namespace Intel {
@@ -321,6 +342,7 @@ namespace Gpu {
 			std::filesystem::path device;
 			std::filesystem::path hwmon;
 			std::filesystem::path power;            //? empty if no power sensor
+			string bus_id;
 			uint32_t pci_device_id;
 			bool has_temp;
 			bool has_freq;
@@ -417,6 +439,8 @@ namespace Shared {
 		if (shown_gpus.contains("amd")) {
 			Gpu::Rsmi::init();
 			Gpu::Asysfs::init(); //? self-skips when rocm-smi already enumerated devices
+			Gpu::AmdDrm::init();
+			Gpu::AmdDrm::apply_static_info(Gpu::gpus);
 		}
 
 		if (shown_gpus.contains("intel")) {
@@ -1590,6 +1614,224 @@ namespace Gpu {
 		}
     }
 
+	namespace AmdDrm {
+		struct static_info {
+			string vram_type;
+			uint32_t vram_bit_width = 0;
+			uint32_t cu_active_number = 0;
+
+			bool empty() const {
+				return vram_type.empty() and vram_bit_width == 0 and cu_active_number == 0;
+			}
+		};
+
+		std::unordered_map<string, static_info> static_info_by_bdf;
+		bool initialized = false;
+
+	#if !defined(STATIC_BUILD)
+		constexpr unsigned AMDGPU_INFO_DEV_INFO = 0x16;
+
+		using amdgpu_device_handle = void*;
+		using amdgpu_device_initialize_fn = int (*)(int, uint32_t*, uint32_t*, amdgpu_device_handle*);
+		using amdgpu_query_info_fn = int (*)(amdgpu_device_handle, unsigned, unsigned, void*);
+		using amdgpu_device_deinitialize_fn = int (*)(amdgpu_device_handle);
+
+		amdgpu_device_initialize_fn amdgpu_device_initialize = nullptr;
+		amdgpu_query_info_fn amdgpu_query_info = nullptr;
+		amdgpu_device_deinitialize_fn amdgpu_device_deinitialize = nullptr;
+		void* drm_dl_handle = nullptr;
+		const array libdrm_alts = {
+			"/opt/hyhal/lib/libhydrm.so",
+			"libdrm_amdgpu.so.1",
+			"libdrm_amdgpu.so"
+		};
+
+		struct drm_amdgpu_info_device_prefix {
+			uint32_t device_id;
+			uint32_t chip_rev;
+			uint32_t external_rev;
+			uint32_t pci_rev;
+			uint32_t family;
+			uint32_t num_shader_engines;
+			uint32_t num_shader_arrays_per_engine;
+			uint32_t gpu_counter_freq;
+			uint64_t max_engine_clock;
+			uint64_t max_memory_clock;
+			uint32_t cu_active_number;
+			uint32_t cu_ao_mask;
+			uint32_t cu_bitmap[4][4];
+			uint32_t enabled_rb_pipes_mask;
+			uint32_t num_rb_pipes;
+			uint32_t num_hw_gfx_contexts;
+			uint32_t pcie_gen;
+			uint64_t ids_flags;
+			uint64_t virtual_address_offset;
+			uint64_t virtual_address_max;
+			uint32_t virtual_address_alignment;
+			uint32_t pte_fragment_size;
+			uint32_t gart_page_size;
+			uint32_t ce_ram_size;
+			uint32_t vram_type;
+			uint32_t vram_bit_width;
+		};
+
+		string vram_type_name(uint32_t vram_type) {
+			switch (vram_type) {
+				case 1: return "GDDR1";
+				case 2: return "DDR2";
+				case 3: return "GDDR3";
+				case 4: return "GDDR4";
+				case 5: return "GDDR5";
+				case 6: return "HBM";
+				case 7: return "DDR3";
+				case 8: return "DDR4";
+				case 9: return "GDDR6";
+				case 10: return "DDR5";
+				case 11: return "LPDDR4";
+				case 12: return "LPDDR5";
+				default: return "";
+			}
+		}
+
+		void close_library() {
+			if (drm_dl_handle != nullptr) {
+				dlclose(drm_dl_handle);
+				drm_dl_handle = nullptr;
+			}
+			amdgpu_device_initialize = nullptr;
+			amdgpu_query_info = nullptr;
+			amdgpu_device_deinitialize = nullptr;
+		}
+
+		bool load_library(const char* lib) {
+			auto load_sym = [](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(drm_dl_handle, sym_name);
+				auto err = dlerror();
+				return err == nullptr ? sym : nullptr;
+			};
+
+			drm_dl_handle = dlopen(lib, RTLD_LAZY);
+			if (drm_dl_handle == nullptr) return false;
+
+			amdgpu_device_initialize = (amdgpu_device_initialize_fn)load_sym("amdgpu_device_initialize");
+			amdgpu_query_info = (amdgpu_query_info_fn)load_sym("amdgpu_query_info");
+			amdgpu_device_deinitialize = (amdgpu_device_deinitialize_fn)load_sym("amdgpu_device_deinitialize");
+			if (amdgpu_device_initialize != nullptr and amdgpu_query_info != nullptr and amdgpu_device_deinitialize != nullptr) {
+				return true;
+			}
+
+			close_library();
+			return false;
+		}
+
+		static_info query_render_node(const fs::path& render_node) {
+			static_info metadata;
+
+			const int fd = open(render_node.c_str(), O_RDWR | O_CLOEXEC);
+			if (fd < 0) return metadata;
+
+			uint32_t major = 0;
+			uint32_t minor = 0;
+			amdgpu_device_handle device = nullptr;
+			int result = amdgpu_device_initialize(fd, &major, &minor, &device);
+			if (result != 0) {
+				close(fd);
+				return metadata;
+			}
+
+			drm_amdgpu_info_device_prefix info{};
+			result = amdgpu_query_info(device, AMDGPU_INFO_DEV_INFO, sizeof(info), &info);
+			if (result == 0) {
+				metadata.vram_type = vram_type_name(info.vram_type);
+				metadata.vram_bit_width = info.vram_bit_width;
+				metadata.cu_active_number = info.cu_active_number;
+			}
+
+			amdgpu_device_deinitialize(device);
+			close(fd);
+			return metadata;
+		}
+
+		void collect_static_info() {
+			static_info_by_bdf.clear();
+
+			const fs::path dri_root("/dev/dri");
+			std::error_code ec;
+			if (not fs::is_directory(dri_root, ec)) {
+				return;
+			}
+
+			for (const auto& entry : fs::directory_iterator(dri_root, ec)) {
+				const string render_node = entry.path().filename().string();
+				if (not render_node.starts_with("renderD")) continue;
+
+				const string bdf = bdf_from_sysfs_device_link(fs::path("/sys/class/drm") / render_node / "device");
+				if (bdf.empty()) continue;
+
+				const static_info metadata = query_render_node(entry.path());
+				if (metadata.empty()) continue;
+
+				static_info_by_bdf[bdf] = metadata;
+			}
+		}
+	#endif
+
+		bool init() {
+			if (initialized) return false;
+			static_info_by_bdf.clear();
+
+		#if defined(STATIC_BUILD)
+			initialized = true;
+			return false;
+		#else
+			for (const auto& lib : libdrm_alts) {
+				if (not load_library(lib)) continue;
+
+				collect_static_info();
+				if (not static_info_by_bdf.empty()) {
+					initialized = true;
+					Logger::debug("AMDGPU DRM: using {}, collected static metadata for {} GPU(s)", lib, static_info_by_bdf.size());
+					return true;
+				}
+
+				Logger::debug("AMDGPU DRM: {} returned no static metadata", lib);
+				close_library();
+			}
+
+			initialized = true;
+			Logger::debug("AMDGPU DRM: no compatible library returned static metadata");
+			return false;
+		#endif
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			static_info_by_bdf.clear();
+		#if !defined(STATIC_BUILD)
+			close_library();
+		#endif
+			initialized = false;
+			return true;
+		}
+
+		void apply_static_info(vector<gpu_info>& gpus) {
+			if (not initialized) init();
+			if (static_info_by_bdf.empty()) return;
+
+			for (auto& gpu : gpus) {
+				if (gpu.bus_id.empty()) continue;
+
+				const auto metadata = static_info_by_bdf.find(normalize_bdf(gpu.bus_id));
+				if (metadata == static_info_by_bdf.end()) continue;
+
+				gpu.vram_type = metadata->second.vram_type;
+				gpu.vram_bit_width = metadata->second.vram_bit_width;
+				gpu.cu_active_number = metadata->second.cu_active_number;
+			}
+		}
+	}
+
 	//? AMD
 	namespace Rsmi {
 		bool init() {
@@ -1805,7 +2047,7 @@ namespace Gpu {
 		}
 
 		string format_bdfid(uint64_t bdfid) {
-			return fmt::format("{:04x}:{:02x}:{:02x}.{}", (bdfid >> 32) & 0xffffffff, (bdfid >> 8) & 0xff, (bdfid >> 3) & 0x1f, bdfid & 0x7);
+			return normalize_bdf(fmt::format("{:04x}:{:02x}:{:02x}.{}", (bdfid >> 32) & 0xffffffff, (bdfid >> 8) & 0xff, (bdfid >> 3) & 0x1f, bdfid & 0x7));
 		}
 
 		void set_bus_id(gpu_info& gpu, uint32_t index) {
@@ -2346,6 +2588,7 @@ namespace Gpu {
 
 				device_paths d{};
 				d.device = device_link;
+				d.bus_id = bdf_from_sysfs_device_link(device_link);
 				try {
 					//? "device" file holds e.g. "0x150e\n" — base 0 lets stoul autodetect the 0x prefix.
 					d.pci_device_id = (uint32_t)std::stoul(readfile(device_link / "device", "0"), nullptr, 0);
@@ -2429,6 +2672,7 @@ namespace Gpu {
 					};
 					//? Start at zero and let the observed peak set the scale, like Intel does (line 1958-ish).
 					gpu.pwr_max_usage = 0;
+					gpu.bus_id = d.bus_id;
 				}
 
 				if (d.has_busy) {
