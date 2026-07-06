@@ -178,6 +178,7 @@ namespace Gpu {
 		string vram_type;
 		uint32_t vram_bit_width = 0;
 		uint32_t cu_active_number = 0;
+		string driver_version;
 
 		array<long long, hsl_link_count> hsl_tx = {-1, -1, -1, -1, -1, -1, -1}; // KB/s
 		array<long long, hsl_link_count> hsl_rx = {-1, -1, -1, -1, -1, -1, -1};

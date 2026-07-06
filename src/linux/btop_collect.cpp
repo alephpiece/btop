@@ -264,11 +264,13 @@ namespace Gpu {
 		#define RSMI_XHCL_LINK_TYPE_SWITCH   1
 		#define RSMI_XHCL_LINK_ALL           255
 		#define RSMI_XHCL_BANDWIDTH_DELAY_MS 10
+		#define RSMI_SW_COMP_DRIVER          0
 
 		typedef int rsmi_status_t,
 					rsmi_temperature_metric_t,
 					rsmi_clk_type_t,
-					rsmi_memory_type_t;
+					rsmi_memory_type_t,
+					rsmi_sw_component_t;
 		typedef uint32_t rsmi_io_link_type_t;
 
 		struct rsmi_version_t {uint32_t major,  minor,  patch; const char* build;};
@@ -299,12 +301,14 @@ namespace Gpu {
 		rsmi_status_t (*rsmi_dev_xhcl_bandwidth_get)(uint32_t, uint32_t, uint8_t, int, rsmi_xhcl_bandwidth_info_t*);
 		rsmi_status_t (*rsmi_dev_xhcl_link_remote_bdfid_get)(uint32_t, uint32_t, uint64_t*);
 		rsmi_status_t (*rsmi_dev_xhcl_link_remote_dev_type_get)(uint32_t, uint32_t, uint32_t*);
+		rsmi_status_t (*rsmi_version_str_get)(rsmi_sw_component_t, char*, uint32_t);
 
 		uint32_t version_major = 0;
 
 		//? Data
 		void* rsmi_dl_handle;
-	#endif
+		#endif
+		string driver_version;
 		bool initialized = false;
 		bool skip_temp_max = false;
 		bool query_pcie_speeds = true;
@@ -741,7 +745,7 @@ namespace Cpu {
         			if (freq_mode == "first") break;
         			++it;
     			}
- 			}
+			}
 
 			if (not frequencies.empty()) {
 				if (freq_mode == "first") {
@@ -1856,12 +1860,42 @@ namespace Gpu {
 
 	//? AMD
 	namespace Rsmi {
+		string trim_driver_version(std::string_view version) {
+			return string(trim(version, " \n\t\r"));
+		}
+
+		string driver_version_from_sysfs() {
+			return trim_driver_version(readfile("/sys/module/hycu/version", ""));
+		}
+
+	#if !defined(RSMI_STATIC)
+		string query_driver_version() {
+			if (rsmi_version_str_get != nullptr) {
+				array<char, 128> version{};
+				const auto result = rsmi_version_str_get(RSMI_SW_COMP_DRIVER, version.data(), version.size());
+				if (result == RSMI_STATUS_SUCCESS) {
+					const auto end = std::find(version.begin(), version.end(), '\0');
+					const string version_str(version.data(), static_cast<size_t>(end - version.begin()));
+					if (const auto trimmed = trim_driver_version(version_str); not trimmed.empty()) {
+						return trimmed;
+					}
+					Logger::debug("ROCm SMI: rsmi_version_str_get returned an empty Hygon driver version");
+				} else {
+					Logger::debug("ROCm SMI: failed to get Hygon driver version through rsmi_version_str_get");
+				}
+			}
+
+			return driver_version_from_sysfs();
+		}
+	#endif
+
 		bool init() {
 			if (initialized) return false;
 			skip_temp_max = false;
 			query_pcie_speeds = true;
 			use_pcie_bandwidth = false;
 			use_xhcl_bandwidth = false;
+			driver_version.clear();
 
 			//? Dynamic loading & linking
 		#if !defined(RSMI_STATIC)
@@ -1872,6 +1906,7 @@ namespace Gpu {
 			rsmi_dev_xhcl_bandwidth_get = nullptr;
 			rsmi_dev_xhcl_link_remote_bdfid_get = nullptr;
 			rsmi_dev_xhcl_link_remote_dev_type_get = nullptr;
+			rsmi_version_str_get = nullptr;
 
 			//? Try possible library paths and names for librocm_smi64.so
 			const array libRocAlts = {
@@ -1889,7 +1924,7 @@ namespace Gpu {
 				if (rsmi_dl_handle != nullptr) {
 					break;
 				}
- 			}
+			}
 
 			if (!rsmi_dl_handle) {
 				Logger::info("Failed to load librocm_smi64.so, AMD GPUs will not be detected: {}", dlerror());
@@ -1931,6 +1966,7 @@ namespace Gpu {
 				rsmi_dev_xhcl_bandwidth_get = (decltype(rsmi_dev_xhcl_bandwidth_get))load_optional_rsmi_sym("rsmi_dev_xhcl_bandwidth_get");
 				rsmi_dev_xhcl_link_remote_bdfid_get = (decltype(rsmi_dev_xhcl_link_remote_bdfid_get))load_optional_rsmi_sym("rsmi_dev_xhcl_link_remote_bdfid_get");
 				rsmi_dev_xhcl_link_remote_dev_type_get = (decltype(rsmi_dev_xhcl_link_remote_dev_type_get))load_optional_rsmi_sym("rsmi_dev_xhcl_link_remote_dev_type_get");
+				rsmi_version_str_get = (decltype(rsmi_version_str_get))load_optional_rsmi_sym("rsmi_version_str_get");
 				use_xhcl_bandwidth = rsmi_topo_get_link_type != nullptr and rsmi_dev_xhcl_bandwidth_get != nullptr;
 				if (use_pcie_bandwidth) {
 					Logger::debug("ROCm SMI: detected Hygon compatibility library; skipping maximum GPU temperature and using fast PCIe bandwidth queries");
@@ -1942,26 +1978,26 @@ namespace Gpu {
 				}
 			}
 
-            #define LOAD_SYM(NAME)  if ((NAME = (decltype(NAME))load_rsmi_sym(#NAME)) == nullptr) return false
+			#define LOAD_SYM(NAME)  if ((NAME = (decltype(NAME))load_rsmi_sym(#NAME)) == nullptr) return false
 
-		    LOAD_SYM(rsmi_init);
-		    LOAD_SYM(rsmi_shut_down);
+			LOAD_SYM(rsmi_init);
+			LOAD_SYM(rsmi_shut_down);
 			LOAD_SYM(rsmi_version_get);
-		    LOAD_SYM(rsmi_num_monitor_devices);
-		    LOAD_SYM(rsmi_dev_name_get);
-		    LOAD_SYM(rsmi_dev_power_cap_get);
-		    LOAD_SYM(rsmi_dev_temp_metric_get);
-		    LOAD_SYM(rsmi_dev_busy_percent_get);
-		    LOAD_SYM(rsmi_dev_memory_busy_percent_get);
-		    LOAD_SYM(rsmi_dev_power_ave_get);
-		    LOAD_SYM(rsmi_dev_memory_total_get);
-		    LOAD_SYM(rsmi_dev_memory_usage_get);
+			LOAD_SYM(rsmi_num_monitor_devices);
+			LOAD_SYM(rsmi_dev_name_get);
+			LOAD_SYM(rsmi_dev_power_cap_get);
+			LOAD_SYM(rsmi_dev_temp_metric_get);
+			LOAD_SYM(rsmi_dev_busy_percent_get);
+			LOAD_SYM(rsmi_dev_memory_busy_percent_get);
+			LOAD_SYM(rsmi_dev_power_ave_get);
+			LOAD_SYM(rsmi_dev_memory_total_get);
+			LOAD_SYM(rsmi_dev_memory_usage_get);
 			if (not is_hygon_rsmi) {
 				LOAD_SYM(rsmi_dev_pci_throughput_get);
 			}
 
-            #undef LOAD_SYM
-        #endif
+			#undef LOAD_SYM
+		#endif
 
 			//? Function calls
 			rsmi_status_t result = rsmi_init(0);
@@ -2019,7 +2055,18 @@ namespace Gpu {
 				return false;
 			}
 			version_major = effective_major;
-		#endif
+			if (is_hygon_rsmi) {
+				driver_version = query_driver_version();
+				if (not driver_version.empty()) {
+					Logger::debug("ROCm SMI: detected Hygon driver version {}", driver_version);
+				}
+			}
+			#else
+			driver_version = driver_version_from_sysfs();
+			if (not driver_version.empty()) {
+				Logger::debug("ROCm SMI: detected Hygon driver version {}", driver_version);
+			}
+			#endif
 
 			//? Device count
 			result = rsmi_num_monitor_devices(&device_count);
@@ -2043,8 +2090,9 @@ namespace Gpu {
 
 		bool shutdown() {
 			if (!initialized) return false;
-    		if (rsmi_shut_down() == RSMI_STATUS_SUCCESS) {
+			if (rsmi_shut_down() == RSMI_STATUS_SUCCESS) {
 				initialized = false;
+				driver_version.clear();
 			#if !defined(RSMI_STATIC)
 				dlclose(rsmi_dl_handle);
 			#endif
@@ -2185,15 +2233,15 @@ namespace Gpu {
 				if constexpr(is_init) {
 					//? Device name
 					char name[RSMI_DEVICE_NAME_BUFFER_SIZE];
-    				result = rsmi_dev_name_get(i, name, RSMI_DEVICE_NAME_BUFFER_SIZE);
-        			if (result != RSMI_STATUS_SUCCESS)
-    					Logger::warning("ROCm SMI: Failed to get device name");
-        			else gpu_names[Nvml::device_count + i] = string(name);
+					result = rsmi_dev_name_get(i, name, RSMI_DEVICE_NAME_BUFFER_SIZE);
+					if (result != RSMI_STATUS_SUCCESS)
+						Logger::warning("ROCm SMI: Failed to get device name");
+					else gpu_names[Nvml::device_count + i] = string(name);
 
-    				//? Power usage
-    				uint64_t max_power;
-    				result = rsmi_dev_power_cap_get(i, 0, &max_power);
-    				if (result != RSMI_STATUS_SUCCESS)
+					//? Power usage
+					uint64_t max_power;
+					result = rsmi_dev_power_cap_get(i, 0, &max_power);
+					if (result != RSMI_STATUS_SUCCESS)
 						Logger::warning("ROCm SMI: Failed to get maximum GPU power draw, defaulting to 225W");
 					else {
 						gpus_slice[i].pwr_max_usage = (long long)(max_power/1000); // RSMI reports power in microWatts
@@ -2216,7 +2264,8 @@ namespace Gpu {
 					set_bus_id(gpus_slice[i], i);
 					detect_xhcl_peers(gpus_slice[i], i);
 					#endif
-    			}
+					gpus_slice[i].driver_version = driver_version;
+				}
 
 				//? GPU utilization
 				if (gpus_slice[i].supported_functions.gpu_utilization) {

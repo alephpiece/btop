@@ -558,6 +558,13 @@ namespace Cpu {
 		const bool gpu_always = show_gpu_info == "On";
 		const bool gpu_auto = show_gpu_info == "Auto";
 		const bool show_gpu = (gpus.size() > 0 and (gpu_always or (gpu_auto and Gpu::shown < Gpu::count)));
+		string gpu_driver_version;
+		for (const auto& gpu : gpus) {
+			if (not gpu.driver_version.empty()) {
+				gpu_driver_version = gpu.driver_version;
+				break;
+			}
+		}
 		auto gpu_hidden = [&](size_t gpu_index) {
 			return gpu_auto and v_contains(Gpu::shown_panels, gpu_index);
 		};
@@ -944,7 +951,17 @@ namespace Cpu {
 			}
 
 			int len = load_avg_pre.size() + load_avg.size();
-			out += Mv::to(b_y + cy, b_x + 1) + string(max(b_width - len - 2, 0), ' ') + Theme::c("main_fg") + Fx::b + load_avg_pre + Fx::ub + load_avg;
+			const int load_avg_padding = max(b_width - len - 2, 0);
+			out += Mv::to(b_y + cy, b_x + 1) + string(load_avg_padding, ' ') + Theme::c("main_fg") + Fx::b + load_avg_pre + Fx::ub + load_avg;
+		#ifdef GPU_SUPPORT
+			if (not gpu_driver_version.empty()) {
+				const string driver_pre = "Driver:";
+				const int driver_len = static_cast<int>(driver_pre.size() + 1 + gpu_driver_version.size());
+				if (driver_len + 1 <= load_avg_padding) {
+					out += Mv::to(b_y + cy, b_x + 1) + Theme::c("main_fg") + Fx::b + driver_pre + Fx::ub + ' ' + gpu_driver_version;
+				}
+			}
+		#endif
 		}
 
 	#ifdef GPU_SUPPORT
