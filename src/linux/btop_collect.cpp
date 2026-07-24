@@ -320,12 +320,15 @@ namespace Gpu {
 		uint32_t device_count = 0;
 	}
 
+	namespace HsaModel {
+		void apply_product_names(const vector<gpu_info>& gpus, vector<string>& names);
+	}
+
 	namespace AmdDrm {
 		bool init();
 		bool shutdown();
 		void apply_static_info(vector<gpu_info>& gpus);
 	}
-
 
 	//? Intel data collection
 	namespace Intel {
@@ -444,6 +447,7 @@ namespace Shared {
 		if (shown_gpus.contains("amd")) {
 			Gpu::Rsmi::init();
 			Gpu::Asysfs::init(); //? self-skips when rocm-smi already enumerated devices
+			Gpu::HsaModel::apply_product_names(Gpu::gpus, Gpu::gpu_names);
 			Gpu::AmdDrm::init();
 			Gpu::AmdDrm::apply_static_info(Gpu::gpus);
 		}
@@ -1639,6 +1643,155 @@ namespace Gpu {
 			return true;
 		}
     }
+
+	namespace HsaModel {
+		bool is_valid_product_name(std::string_view name) {
+			if (name.empty()) return false;
+			if (name.size() < 2 or name[0] != '0' or (name[1] != 'x' and name[1] != 'X')) return true;
+			if (name.size() == 2) return false;
+
+			return not rng::all_of(name.substr(2), [](const char character) {
+				return (character >= '0' and character <= '9')
+					or (character >= 'a' and character <= 'f')
+					or (character >= 'A' and character <= 'F');
+			});
+		}
+
+	#if !defined(STATIC_BUILD)
+		constexpr int HSA_STATUS_SUCCESS = 0;
+		constexpr int HSA_DEVICE_TYPE_GPU = 1;
+		constexpr int HSA_AGENT_INFO_DEVICE = 17;
+		constexpr int HSA_AMD_AGENT_INFO_BDFID = 0xA006;
+		constexpr int HSA_AMD_AGENT_INFO_PRODUCT_NAME = 0xA009;
+		constexpr int HSA_AMD_AGENT_INFO_DOMAIN = 0xA00F;
+		constexpr size_t HSA_PRODUCT_NAME_SIZE = 64;
+
+		struct hsa_agent_t {
+			uint64_t handle;
+		};
+
+		using hsa_status_t = int;
+		using hsa_agent_info_t = int;
+		using hsa_device_type_t = int;
+		using hsa_callback_t = hsa_status_t (*)(hsa_agent_t, void*);
+		using hsa_init_fn = hsa_status_t (*)();
+		using hsa_shut_down_fn = hsa_status_t (*)();
+		using hsa_iterate_agents_fn = hsa_status_t (*)(hsa_callback_t, void*);
+		using hsa_agent_get_info_fn = hsa_status_t (*)(hsa_agent_t, hsa_agent_info_t, void*);
+
+		struct query_context {
+			hsa_agent_get_info_fn get_info;
+			std::unordered_map<string, size_t>& gpu_index_by_bdf;
+			vector<string>& names;
+			size_t replacements = 0;
+		};
+
+		string format_bdf(uint32_t domain, uint32_t bdf) {
+			return normalize_bdf(fmt::format(
+				"{:04x}:{:02x}:{:02x}.{}",
+				domain,
+				(bdf >> 8) & 0xff,
+				(bdf >> 3) & 0x1f,
+				bdf & 0x7));
+		}
+
+		string product_name_from_buffer(const array<char, HSA_PRODUCT_NAME_SIZE>& product_name) {
+			const auto end = std::find(product_name.begin(), product_name.end(), '\0');
+			return string(trim(
+				std::string_view(product_name.data(), static_cast<size_t>(end - product_name.begin())),
+				" \n\t\r"));
+		}
+
+		hsa_status_t collect_agent_name(hsa_agent_t agent, void* data) {
+			auto& context = *static_cast<query_context*>(data);
+
+			hsa_device_type_t device_type = 0;
+			if (context.get_info(agent, HSA_AGENT_INFO_DEVICE, &device_type) != HSA_STATUS_SUCCESS
+				or device_type != HSA_DEVICE_TYPE_GPU) {
+				return HSA_STATUS_SUCCESS;
+			}
+
+			uint32_t bdf = 0;
+			uint32_t domain = 0;
+			array<char, HSA_PRODUCT_NAME_SIZE> product_name{};
+			if (context.get_info(agent, HSA_AMD_AGENT_INFO_BDFID, &bdf) != HSA_STATUS_SUCCESS
+				or context.get_info(agent, HSA_AMD_AGENT_INFO_DOMAIN, &domain) != HSA_STATUS_SUCCESS
+				or context.get_info(agent, HSA_AMD_AGENT_INFO_PRODUCT_NAME, product_name.data()) != HSA_STATUS_SUCCESS) {
+				return HSA_STATUS_SUCCESS;
+			}
+
+			const auto gpu = context.gpu_index_by_bdf.find(format_bdf(domain, bdf));
+			if (gpu == context.gpu_index_by_bdf.end()) return HSA_STATUS_SUCCESS;
+
+			const string name = product_name_from_buffer(product_name);
+			if (not is_valid_product_name(name)) return HSA_STATUS_SUCCESS;
+
+			context.names[gpu->second] = name;
+			context.replacements++;
+			return HSA_STATUS_SUCCESS;
+		}
+	#endif
+
+		void apply_product_names(const vector<gpu_info>& gpus, vector<string>& names) {
+		#if defined(STATIC_BUILD)
+			(void)gpus;
+			(void)names;
+		#else
+			std::unordered_map<string, size_t> gpu_index_by_bdf;
+			const size_t gpu_count = std::min(gpus.size(), names.size());
+			for (size_t index = 0; index < gpu_count; ++index) {
+				if (gpus[index].bus_id.empty()) continue;
+				gpu_index_by_bdf[normalize_bdf(gpus[index].bus_id)] = index;
+			}
+			if (gpu_index_by_bdf.empty()) return;
+
+			constexpr auto HSA_LIBRARY = "/opt/hyhal/lib/libhsa-runtime64.so";
+			void* handle = dlopen(HSA_LIBRARY, RTLD_LAZY);
+			if (handle == nullptr) {
+				Logger::debug("HSA model names: failed to load {}", HSA_LIBRARY);
+				return;
+			}
+
+			auto load_symbol = [handle](const char symbol_name[]) {
+				(void)dlerror();
+				auto symbol = dlsym(handle, symbol_name);
+				auto error = dlerror();
+				return error == nullptr ? symbol : nullptr;
+			};
+
+			const auto hsa_init = reinterpret_cast<hsa_init_fn>(load_symbol("hsa_init"));
+			const auto hsa_shut_down = reinterpret_cast<hsa_shut_down_fn>(load_symbol("hsa_shut_down"));
+			const auto hsa_iterate_agents = reinterpret_cast<hsa_iterate_agents_fn>(load_symbol("hsa_iterate_agents"));
+			const auto hsa_agent_get_info = reinterpret_cast<hsa_agent_get_info_fn>(load_symbol("hsa_agent_get_info"));
+			if (hsa_init == nullptr or hsa_shut_down == nullptr
+				or hsa_iterate_agents == nullptr or hsa_agent_get_info == nullptr) {
+				Logger::debug("HSA model names: required symbols are unavailable");
+				dlclose(handle);
+				return;
+			}
+
+			if (hsa_init() != HSA_STATUS_SUCCESS) {
+				Logger::debug("HSA model names: initialization failed");
+				dlclose(handle);
+				return;
+			}
+
+			query_context context{hsa_agent_get_info, gpu_index_by_bdf, names};
+			const auto iterate_result = hsa_iterate_agents(collect_agent_name, &context);
+			const auto shutdown_result = hsa_shut_down();
+			dlclose(handle);
+
+			if (iterate_result != HSA_STATUS_SUCCESS) {
+				Logger::debug("HSA model names: agent enumeration failed");
+			} else {
+				Logger::debug("HSA model names: applied product names to {} GPU(s)", context.replacements);
+			}
+			if (shutdown_result != HSA_STATUS_SUCCESS) {
+				Logger::debug("HSA model names: shutdown failed");
+			}
+		#endif
+		}
+	}
 
 	namespace AmdDrm {
 		struct static_info {
