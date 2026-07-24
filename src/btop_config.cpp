@@ -47,6 +47,19 @@ namespace rng = std::ranges;
 using namespace std::literals;
 using namespace Tools;
 
+const vector<string> Config::valid_graph_symbols = { "braille", "block", "tty" };
+const vector<string> Config::valid_graph_symbols_def = { "default", "braille", "block", "tty" };
+const vector<string> Config::valid_boxes = {"cpu", "mem", "net", "proc"};
+const vector<string> Config::temp_scales = { "celsius", "fahrenheit", "kelvin", "rankine" };
+#ifdef __linux__
+const vector<string> Config::freq_modes = { "first", "range", "lowest", "highest", "average" };
+#endif
+#ifdef GPU_SUPPORT
+const vector<string> Config::show_gpu_values = { "Auto", "On", "Off" };
+#endif
+const vector<string> Config::base_10_bitrate_values = { "Auto", "True", "False" };
+const vector<string> Config::disable_preset_options = { "Off", "Default", "Custom", "All" };
+
 //* Functions and variables for reading and writing the btop config file
 namespace Config {
 
@@ -459,6 +472,7 @@ namespace Config {
 	std::optional<int> current_preset;
 
 #ifdef GPU_SUPPORT
+	static constexpr size_t max_gpu_panels = 6;
 	static constexpr array<int, max_gpu_panels> gpu_panel_keys = {5, 6, 7, 8, 9, 0};
 
 	std::optional<size_t> gpu_box_index(std::string_view box) {
