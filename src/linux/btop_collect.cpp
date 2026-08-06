@@ -365,6 +365,73 @@ namespace Gpu {
 		uint32_t device_count = 0;
 		vector<device_paths> devices;
 	}
+
+	//? MetaX data collection
+	namespace Mxsml {
+		//? Minimal regular mxSML ABI, probed with mx-smi 2.2.12 and driver 3.6.11.
+		//? Units: memory KiB, temperatures 0.01 °C, power mW and PCIe throughput MB/s.
+		#define MXSML_SUCCESS                    0
+		#define MXSML_USAGE_VPUE                 1
+		#define MXSML_USAGE_VPUD                 2
+		#define MXSML_USAGE_XCORE                4
+		#define MXSML_TEMPERATURE_HOTSPOT        0
+		#define MXSML_TEMPERATURE_HOT_LIMIT      1
+		#define MXSML_CLOCK_XCORE               11
+		#define MXSML_VERSION_DRIVER             1
+		#define MXSML_MAX_CLOCKS                 9
+
+		typedef uint32_t mxsml_return_t,
+					 mxsml_usage_ip_t,
+					 mxsml_temperature_sensor_t,
+					 mxsml_clock_ip_t,
+					 mxsml_version_unit_t;
+
+		struct mxsml_device_info_t {
+			uint32_t device_id;
+			uint32_t type;
+			char bdf_id[32];
+			uint32_t gpu_id;
+			uint32_t node_id;
+			char uuid[96];
+			uint32_t brand;
+			uint32_t mode;
+			char device_name[32];
+		};
+		struct mxsml_memory_info_t {
+			int64_t vis_vram_total;
+			int64_t vis_vram_used;
+			int64_t vram_total;
+			int64_t vram_used;
+			int64_t xtt_total;
+			int64_t xtt_used;
+		};
+		struct mxsml_board_power_info_t {uint32_t voltage, current, power;};
+		struct mxsml_pcie_throughput_t {int rx, tx;};
+		static_assert(sizeof(mxsml_device_info_t) == 184);
+		static_assert(sizeof(mxsml_memory_info_t) == 48);
+		static_assert(sizeof(mxsml_board_power_info_t) == 12);
+		static_assert(sizeof(mxsml_pcie_throughput_t) == 8);
+
+		mxsml_return_t (*mxSmlInit)();
+		uint32_t (*mxSmlGetDeviceCount)();
+		mxsml_return_t (*mxSmlGetDeviceInfo)(uint32_t, mxsml_device_info_t*);
+		mxsml_return_t (*mxSmlGetDeviceIpUsage)(uint32_t, mxsml_usage_ip_t, int*);
+		mxsml_return_t (*mxSmlGetMemoryInfo)(uint32_t, mxsml_memory_info_t*);
+		mxsml_return_t (*mxSmlGetTemperatureInfo)(uint32_t, mxsml_temperature_sensor_t, int*);
+		mxsml_return_t (*mxSmlGetBoardPowerInfo)(uint32_t, uint32_t*, mxsml_board_power_info_t*);
+		mxsml_return_t (*mxSmlGetBoardPowerLimit)(uint32_t, uint32_t*);
+		mxsml_return_t (*mxSmlGetClocks)(uint32_t, mxsml_clock_ip_t, uint32_t*, uint32_t*);
+		mxsml_return_t (*mxSmlGetPcieThroughput)(uint32_t, mxsml_pcie_throughput_t*);
+		mxsml_return_t (*mxSmlGetDeviceVersion)(uint32_t, mxsml_version_unit_t, char*, uint32_t*);
+		const char* (*mxSmlGetErrorString)(mxsml_return_t);
+
+		void* mxsml_dl_handle = nullptr;
+		bool initialized = false;
+		bool init();
+		bool shutdown();
+		template <bool is_init> bool collect(gpu_info* gpus_slice);
+		uint32_t device_count = 0;
+	}
 }
 
 #endif // GPU_SUPPORT
@@ -450,6 +517,10 @@ namespace Shared {
 			Gpu::HsaModel::apply_product_names(Gpu::gpus, Gpu::gpu_names);
 			Gpu::AmdDrm::init();
 			Gpu::AmdDrm::apply_static_info(Gpu::gpus);
+		}
+
+		if (shown_gpus.contains("metax")) {
+			Gpu::Mxsml::init();
 		}
 
 		if (shown_gpus.contains("intel")) {
@@ -2679,15 +2750,15 @@ namespace Gpu {
 			gpu_names.resize(gpus.size() + device_count);
 
 			if (gpu_device_name) {
-				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count] = string(gpu_device_name);
+				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Mxsml::device_count] = string(gpu_device_name);
 			} else {
-				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count] = "Intel GPU";
+				gpu_names[Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Mxsml::device_count] = "Intel GPU";
 			}
 
 			free(gpu_device_name);
 
 			initialized = true;
-			Intel::collect<1>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count);
+			Intel::collect<1>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Mxsml::device_count);
 
 			return true;
 		}
@@ -2938,6 +3009,280 @@ namespace Gpu {
 		template bool collect<1>(gpu_info*);
 	}
 
+	namespace Mxsml {
+		size_t offset() {
+			return Nvml::device_count + Rsmi::device_count + Asysfs::device_count;
+		}
+
+		string error_string(mxsml_return_t result) {
+			if (mxSmlGetErrorString != nullptr) {
+				if (const char* error = mxSmlGetErrorString(result); error != nullptr) return error;
+			}
+			return fmt::format("status {}", result);
+		}
+
+		bool init() {
+			if (initialized) return false;
+		#if defined(STATIC_BUILD)
+			return false;
+		#else
+			const array libMxsmlAlts = {
+				"/opt/mxdriver/lib/libmxsml.so",
+				"libmxsml.so.2",
+				"libmxsml.so",
+			};
+
+			for (const auto& library : libMxsmlAlts) {
+				(void)dlerror();
+				mxsml_dl_handle = dlopen(library, RTLD_LAZY | RTLD_LOCAL);
+				if (mxsml_dl_handle != nullptr) break;
+			}
+			if (mxsml_dl_handle == nullptr) {
+				Logger::info("Failed to load libmxsml.so, MetaX GPUs will not be detected: {}", dlerror());
+				return false;
+			}
+
+			auto load_mxsml_sym = [&](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(mxsml_dl_handle, sym_name);
+				auto err = dlerror();
+				if (err != nullptr) {
+					Logger::error("mxSML: Couldn't find function {}: {}", sym_name, err);
+					return (void*)nullptr;
+				}
+				return sym;
+			};
+
+			auto load_optional_mxsml_sym = [&](const char sym_name[]) {
+				(void)dlerror();
+				auto sym = dlsym(mxsml_dl_handle, sym_name);
+				return dlerror() == nullptr ? sym : nullptr;
+			};
+
+			#define LOAD_MXSML_SYM(NAME) if ((NAME = (decltype(NAME))load_mxsml_sym(#NAME)) == nullptr) { \
+				dlclose(mxsml_dl_handle); \
+				mxsml_dl_handle = nullptr; \
+				return false; \
+			}
+
+			LOAD_MXSML_SYM(mxSmlInit);
+			LOAD_MXSML_SYM(mxSmlGetDeviceCount);
+
+			#undef LOAD_MXSML_SYM
+
+			mxSmlGetDeviceInfo = (decltype(mxSmlGetDeviceInfo))load_optional_mxsml_sym("mxSmlGetDeviceInfo");
+			mxSmlGetDeviceIpUsage = (decltype(mxSmlGetDeviceIpUsage))load_optional_mxsml_sym("mxSmlGetDeviceIpUsage");
+			mxSmlGetMemoryInfo = (decltype(mxSmlGetMemoryInfo))load_optional_mxsml_sym("mxSmlGetMemoryInfo");
+			mxSmlGetTemperatureInfo = (decltype(mxSmlGetTemperatureInfo))load_optional_mxsml_sym("mxSmlGetTemperatureInfo");
+			mxSmlGetBoardPowerInfo = (decltype(mxSmlGetBoardPowerInfo))load_optional_mxsml_sym("mxSmlGetBoardPowerInfo");
+			mxSmlGetClocks = (decltype(mxSmlGetClocks))load_optional_mxsml_sym("mxSmlGetClocks");
+			mxSmlGetBoardPowerLimit = (decltype(mxSmlGetBoardPowerLimit))load_optional_mxsml_sym("mxSmlGetBoardPowerLimit");
+			mxSmlGetPcieThroughput = (decltype(mxSmlGetPcieThroughput))load_optional_mxsml_sym("mxSmlGetPcieThroughput");
+			mxSmlGetDeviceVersion = (decltype(mxSmlGetDeviceVersion))load_optional_mxsml_sym("mxSmlGetDeviceVersion");
+			mxSmlGetErrorString = (decltype(mxSmlGetErrorString))load_optional_mxsml_sym("mxSmlGetErrorString");
+
+			const auto result = mxSmlInit();
+			if (result != MXSML_SUCCESS) {
+				Logger::debug("Failed to initialize mxSML, MetaX GPUs will not be detected: {}", error_string(result));
+				dlclose(mxsml_dl_handle);
+				mxsml_dl_handle = nullptr;
+				return false;
+			}
+
+			device_count = mxSmlGetDeviceCount();
+			if (device_count == 0) {
+				Logger::debug("mxSML initialized but reported no MetaX GPUs");
+				return false;
+			}
+			initialized = true;
+
+			const size_t gpu_offset = offset();
+			gpus.resize(gpus.size() + device_count);
+			gpu_names.resize(gpus.size());
+			Logger::info("Using mxSML for {} MetaX GPU(s)", device_count);
+			Mxsml::collect<1>(gpus.data() + gpu_offset);
+			return true;
+		#endif
+		}
+
+		bool shutdown() {
+			if (not initialized) return false;
+			//? The regular mxSML ABI has no shutdown operation. Keep the library loaded
+			//? until process exit rather than unloading it while vendor state may be live.
+			initialized = false;
+			device_count = 0;
+			return true;
+		}
+
+		template <bool is_init> bool collect(gpu_info* gpus_slice) {
+			if (not initialized) return false;
+
+			for (uint32_t i = 0; i < device_count; ++i) {
+				gpu_info& gpu = gpus_slice[i];
+
+				if constexpr (is_init) {
+					gpu.supported_functions = {
+						.gpu_utilization = mxSmlGetDeviceIpUsage != nullptr,
+						.mem_utilization = false,
+						.gpu_clock = mxSmlGetClocks != nullptr,
+						.mem_clock = false,
+						.pwr_usage = mxSmlGetBoardPowerInfo != nullptr,
+						.pwr_state = false,
+						.temp_info = mxSmlGetTemperatureInfo != nullptr,
+						.mem_total = mxSmlGetMemoryInfo != nullptr,
+						.mem_used = mxSmlGetMemoryInfo != nullptr,
+						.pcie_txrx = mxSmlGetPcieThroughput != nullptr,
+						.encoder_utilization = mxSmlGetDeviceIpUsage != nullptr,
+						.decoder_utilization = mxSmlGetDeviceIpUsage != nullptr,
+					};
+
+					gpu_names[offset() + i] = "MetaX GPU";
+					if (mxSmlGetDeviceInfo != nullptr) {
+						mxsml_device_info_t info{};
+						const auto info_result = mxSmlGetDeviceInfo(i, &info);
+						if (info_result == MXSML_SUCCESS) {
+							if (info.device_name[0] != '\0') gpu_names[offset() + i] = string(info.device_name);
+							gpu.bus_id = normalize_bdf(info.bdf_id);
+						} else Logger::warning("mxSML: Failed to get GPU{} device information: {}", i, error_string(info_result));
+					}
+
+					if (mxSmlGetDeviceVersion != nullptr) {
+						array<char, 64> driver_version{};
+						uint32_t version_size = driver_version.size();
+						const auto version_result = mxSmlGetDeviceVersion(i, MXSML_VERSION_DRIVER, driver_version.data(), &version_size);
+						if (version_result == MXSML_SUCCESS) gpu.driver_version = driver_version.data();
+						else Logger::debug("mxSML: Failed to get GPU{} driver version: {}", i, error_string(version_result));
+					}
+
+					if (mxSmlGetBoardPowerLimit != nullptr) {
+						uint32_t power_limit = 0;
+						const auto power_limit_result = mxSmlGetBoardPowerLimit(i, &power_limit);
+						if (power_limit_result == MXSML_SUCCESS and power_limit > 0) {
+							gpu.pwr_max_usage = power_limit;
+							gpu_pwr_total_max += power_limit;
+						} else Logger::debug("mxSML: Failed to get GPU{} power limit: {}", i, error_string(power_limit_result));
+					}
+
+					if (mxSmlGetTemperatureInfo != nullptr) {
+						int temperature_limit = 0;
+						const auto temperature_limit_result = mxSmlGetTemperatureInfo(i, MXSML_TEMPERATURE_HOT_LIMIT, &temperature_limit);
+						if (temperature_limit_result == MXSML_SUCCESS)
+							gpu.temp_max = llround(temperature_limit / 100.0);
+						else Logger::debug("mxSML: Failed to get GPU{} temperature limit: {}", i, error_string(temperature_limit_result));
+					}
+				}
+
+				if (gpu.supported_functions.gpu_utilization) {
+					int utilization = 0;
+					const auto result = mxSmlGetDeviceIpUsage(i, MXSML_USAGE_XCORE, &utilization);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} utilization: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.gpu_utilization = false;
+					} else gpu.gpu_percent.at("gpu-totals").push_back(clamp((long long)utilization, 0ll, 100ll));
+				}
+
+				if (gpu.supported_functions.gpu_clock) {
+					array<uint32_t, MXSML_MAX_CLOCKS> clocks{};
+					uint32_t clock_count = clocks.size();
+					const auto result = mxSmlGetClocks(i, MXSML_CLOCK_XCORE, &clock_count, clocks.data());
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} clock speed: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.gpu_clock = false;
+					} else {
+						gpu.gpu_clock_speed = 0;
+						for (uint32_t clock = 0; clock < min<uint32_t>(clock_count, clocks.size()); ++clock)
+							gpu.gpu_clock_speed = max(gpu.gpu_clock_speed, clocks[clock]);
+					}
+				}
+
+				if (gpu.supported_functions.pwr_usage) {
+					array<mxsml_board_power_info_t, 4> power_info{};
+					uint32_t power_info_count = power_info.size();
+					const auto result = mxSmlGetBoardPowerInfo(i, &power_info_count, power_info.data());
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} power usage: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.pwr_usage = false;
+					} else {
+						gpu.pwr_usage = 0;
+						for (uint32_t way = 0; way < min<uint32_t>(power_info_count, power_info.size()); ++way)
+							gpu.pwr_usage += power_info[way].power;
+						gpu.pwr_max_usage = max(gpu.pwr_max_usage, gpu.pwr_usage);
+						if (gpu.pwr_max_usage > 0) {
+							gpu.gpu_percent.at("gpu-pwr-totals").push_back(
+								clamp((long long)round((double)gpu.pwr_usage * 100.0 / (double)gpu.pwr_max_usage), 0ll, 100ll));
+						}
+					}
+				}
+
+				if (gpu.supported_functions.temp_info and Config::getB("check_temp")) {
+					int temperature = 0;
+					const auto result = mxSmlGetTemperatureInfo(i, MXSML_TEMPERATURE_HOTSPOT, &temperature);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} temperature: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.temp_info = false;
+					} else gpu.temp.push_back(llround(temperature / 100.0));
+				}
+
+				if (gpu.supported_functions.mem_total or gpu.supported_functions.mem_used) {
+					mxsml_memory_info_t memory{};
+					const auto result = mxSmlGetMemoryInfo(i, &memory);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} memory information: {}", i, error_string(result));
+						if constexpr (is_init) {
+							gpu.supported_functions.mem_total = false;
+							gpu.supported_functions.mem_used = false;
+						}
+					} else {
+						gpu.mem_total = max<long long>(memory.vram_total, 0) * 1024;
+						gpu.mem_used = max<long long>(memory.vram_used, 0) * 1024;
+						if (gpu.mem_total > 0) {
+							gpu.gpu_percent.at("gpu-vram-totals").push_back(
+								clamp((long long)round((double)gpu.mem_used * 100.0 / (double)gpu.mem_total), 0ll, 100ll));
+						}
+					}
+				}
+
+				if (gpu.supported_functions.encoder_utilization) {
+					int utilization = 0;
+					const auto result = mxSmlGetDeviceIpUsage(i, MXSML_USAGE_VPUE, &utilization);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} encoder utilization: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.encoder_utilization = false;
+					} else gpu.encoder_utilization = clamp((long long)utilization, 0ll, 100ll);
+				}
+
+				if (gpu.supported_functions.decoder_utilization) {
+					int utilization = 0;
+					const auto result = mxSmlGetDeviceIpUsage(i, MXSML_USAGE_VPUD, &utilization);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} decoder utilization: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.decoder_utilization = false;
+					} else gpu.decoder_utilization = clamp((long long)utilization, 0ll, 100ll);
+				}
+
+				if (gpu.supported_functions.pcie_txrx and (Config::getB("mxsml_measure_pcie_speeds") or is_init)) {
+					mxsml_pcie_throughput_t throughput{};
+					const auto result = mxSmlGetPcieThroughput(i, &throughput);
+					if (result != MXSML_SUCCESS) {
+						Logger::warning("mxSML: Failed to get GPU{} PCIe throughput: {}", i, error_string(result));
+						if constexpr (is_init) gpu.supported_functions.pcie_txrx = false;
+					} else {
+						gpu.pcie_rx = throughput.rx >= 0 ? (long long)throughput.rx * 1000 : -1;
+						gpu.pcie_tx = throughput.tx >= 0 ? (long long)throughput.tx * 1000 : -1;
+					}
+				} else {
+					gpu.pcie_rx = -1;
+					gpu.pcie_tx = -1;
+				}
+			}
+			return true;
+		}
+
+		//? Explicit template instantiations referenced from Shared::init and Gpu::collect.
+		template bool collect<0>(gpu_info*);
+		template bool collect<1>(gpu_info*);
+	}
+
 	//? Collect data from GPU-specific libraries
 	auto collect(bool no_update) -> vector<gpu_info>& {
 		if (Runner::stopping or (no_update and not gpus.empty())) return gpus;
@@ -2948,7 +3293,8 @@ namespace Gpu {
 		Nvml::collect<0>(gpus.data()); // raw pointer to vector data, size == Nvml::device_count
 		Rsmi::collect<0>(gpus.data() + Nvml::device_count); // size = Rsmi::device_count
 		Asysfs::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count); // size = Asysfs::device_count
-		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Intel::device_count
+		Mxsml::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count); // size = Mxsml::device_count
+		Intel::collect<0>(gpus.data() + Nvml::device_count + Rsmi::device_count + Asysfs::device_count + Mxsml::device_count); // size = Intel::device_count
 
 		//* Calculate average usage
 		long long avg = 0;

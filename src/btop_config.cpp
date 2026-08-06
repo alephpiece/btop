@@ -254,8 +254,10 @@ namespace Config {
 								"#* Measure PCIe throughput on NVIDIA cards, may impact performance on certain cards."},
 		{"rsmi_measure_pcie_speeds",
 								"#* Measure PCIe throughput on AMD cards, may impact performance on certain cards."},
+		{"mxsml_measure_pcie_speeds",
+								"#* Measure PCIe throughput on MetaX cards, may impact performance on certain cards."},
 		{"gpu_mirror_graph",	"#* Horizontally mirror the GPU graph."},
-		{"shown_gpus",			"#* Set which GPU vendors to show. Available values are \"nvidia amd intel apple\""},
+		{"shown_gpus",			"#* Set which GPU vendors to show. Available values are \"nvidia amd intel metax apple\""},
 		{"custom_gpu_name0",	"#* Custom gpu0 model name, empty string to disable."},
 		{"custom_gpu_name1",	"#* Custom gpu1 model name, empty string to disable."},
 		{"custom_gpu_name2",	"#* Custom gpu2 model name, empty string to disable."},
@@ -304,7 +306,7 @@ namespace Config {
 		{"custom_gpu_name4", ""},
 		{"custom_gpu_name5", ""},
 		{"show_gpu_info", "Auto"},
-		{"shown_gpus", "nvidia amd intel apple"}
+		{"shown_gpus", "nvidia amd intel metax apple"}
 	#endif
 	};
 	std::unordered_map<std::string_view, string> stringsTmp;
@@ -368,6 +370,7 @@ namespace Config {
 	#ifdef GPU_SUPPORT
 		{"nvml_measure_pcie_speeds", true},
 		{"rsmi_measure_pcie_speeds", true},
+		{"mxsml_measure_pcie_speeds", false},
 		{"gpu_mirror_graph", true},
 	#endif
 		{"terminal_sync", true},
@@ -1017,12 +1020,15 @@ namespace Config {
 
 		std::ifstream cread(conf_file);
 		if (cread.good()) {
+			bool config_version_changed = false;
 			vector<string> valid_names;
 			valid_names.reserve(descriptions.size());
 			for (const auto &n : descriptions)
 				valid_names.push_back(n[0]);
-			if (string v_string; cread.peek() != '#' or (getline(cread, v_string, '\n') and not v_string.contains(Global::Version)))
+			if (string v_string; cread.peek() != '#' or (getline(cread, v_string, '\n') and not v_string.contains(Global::Version))) {
 				write_new = true;
+				config_version_changed = true;
+			}
 			while (not cread.eof()) {
 				cread >> std::ws;
 				if (cread.peek() == '#') {
@@ -1070,6 +1076,11 @@ namespace Config {
 
 				cread.ignore(SSmax, '\n');
 			}
+		#ifdef GPU_SUPPORT
+			//? Preserve explicit vendor filters, but migrate the previous default on version upgrades.
+			if (config_version_changed and strings.at("shown_gpus") == "nvidia amd intel apple")
+				strings.at("shown_gpus") = "nvidia amd intel metax apple";
+		#endif
 
 			if (not load_warnings.empty()) write_new = true;
 		}

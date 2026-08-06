@@ -205,6 +205,9 @@ namespace Gpu {
 		extern bool shutdown();
 	}
 	#ifdef __linux__
+	namespace Mxsml {
+		extern bool shutdown();
+	}
 	namespace AmdDrm {
 		extern bool shutdown();
 	}
